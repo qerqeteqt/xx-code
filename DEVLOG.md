@@ -322,18 +322,112 @@ python -m code_agent.cli --repo D:/tmp_m3_final2 "运行测试，把失败的修
 
 ---
 
-## 下一步
+## M4 — 联网检索 + 输出美化 + 文档（2026-09-12）
 
-**M4 — 联网检索 + 输出美化 + 文档**
+### 目标
 
-- `code_agent/tools/web.py`：接入已装好的 `TavilySearch`（给 Explorer），无 key 时自动禁用
-- CLI 输出：用 `rich` 美化 trace（区分角色配色、折叠长输出）
-- 评估：`ContextEditingMiddleware` 的清理阈值是否够用；是否需要 `SummarizationMiddleware`
+收尾：接上联网检索、美化 CLI 输出、评估上下文压缩是否需要加摘要层。
 
-**已识别的最大改进点（v2 方向）**：把编排从「方案 A：共享 messages」升级为
-「方案 B：各 worker 独立 `findings`/`edits`/`verdict` 通道」——
-上面第 7 条的空转、以及上下文膨胀，根源都在方案 A。升级时注意
-**父子两侧 `state_schema` 必须同时声明通道**，否则会被静默丢弃。
+### 改动
+
+| 文件 | 说明 |
+|---|---|
+| `code_agent/tools/web.py` | 新增 `web_search`（Tavily），未配 key 时自动禁用 |
+| `code_agent/workers.py` | Explorer 接入 `web_search`；`_build` 支持 `checkpointer` |
+| `code_agent/cli.py` | `rich` 美化（角色配色 + 面板）；抽出 `_stream_once`/`_drive`；`--agent` 补 checkpointer |
+| `tests/test_web.py` | 新增：启用条件 + 输出截断 |
+| `README.md` | 补完整模式用法、目录结构、路线图收尾 |
+
+设计要点：
+
+- **不用裸的 `TavilySearch`**，而是包一层 `@tool` + `safe`：既保证"工具绝不抛异常"
+  （网络失败返回错误字符串而不是崩掉整个 run），又对结果做**源头截断**
+  （Tavily 返回的正文很长，`MAX_CHARS=2000`）。
+- 未配置 `TAVILY_API_KEY` → `build_web_tools()` 返回空列表，`web_search` 自动禁用、不影响其余功能。
+- `--agent` 模式改用 `InMemorySaver`：修掉 M3 遗留的崩溃点（见坑 1）。
+- rich 输出：角色配色 + 最终结论面板；所有来自模型/工具的动态文本都 `escape()`（见坑 2）。
+
+### 验证
+
+```bash
+"C:\Users\x_x\.conda\envs\langgraph\python.exe" -m pytest
+# => 75 passed, 1 skipped
+```
+
+**`web_search` 实测**（显式要求联网，确认接线正确）：
+
+```
+python -m code_agent.cli --repo D:/tmp_m4_web --agent explorer "请用 web_search 查一下 Command(goto=) 的用途"
+explorer  → web_search({"query": "LangGraph Command goto 用途"})
+explorer  → web_search({"query": "LangGraph Command(goto=...) usage documentation"})
+→ 返回官方博客 / API 参考等结果
+```
+
+**端到端回归**（角色配色 + 结论面板）：
+
+```
+[supervisor] 下一步 → verifier（尚未运行过测试…）
+verifier  → list_dir / glob_search / read_file ×2 / run_command ×4
+[supervisor] 下一步 → coder（已跑出失败：mathx.py 的 double 返回 n+n+1）
+coder     → edit_file / read_file
+[supervisor] 下一步 → verifier（已修复，待验证）
+verifier  → run_command(pytest) / run_command(边界抽查) / read_file ×2
+[supervisor] 下一步 → finish（1 passed，任务完成）
+┌──────── 最终结论 ────────┐   ← 绿色面板，内容为 verifier 的「## 通过」报告
+```
+
+### 上下文压缩评估（基于实测数据，不是拍脑袋）
+
+单次小型任务（改 1 个文件 + 跑测试）：
+
+| 指标 | 数值 |
+|---|---|
+| 消息总数 | 31（Human 4 / AI 12 / Tool 15） |
+| 消息文本总字符 | ~14,600（粗估 ≈5.8k tokens） |
+| **supervisor 实际看到的** | 3,040 字符（只喂摘要，不喂原始消息） |
+
+结论：**暂不加 `SummarizationMiddleware`**。已有机制已能支撑中小任务：
+① 工具内源头截断 ② `ContextEditingMiddleware` 只留最近 3 条工具结果（且不写 checkpoint）
+③ supervisor 只吃摘要。
+摘要层要多一次 LLM 调用、且失败会被静默吞掉，收益不明显。
+**重新评估的触发条件**：单次运行消息数 > 60 条，或消息文本总字符 > 60k。
+
+### 备注与坑
+
+1. **`--agent` 模式下 worker 调用危险命令会崩**。`interrupt()` 需要 checkpointer，
+   而单 agent 模式原本没有 → 抛异常。→ 该模式改用 `InMemorySaver`，现在也能正常暂停确认。
+2. **rich 会把内容里的 `[...]` 当成标记解析**（我们的 trace 本身就用 `[角色]` 做标记，
+   模型输出里也常有方括号）。→ 所有动态文本经 `rich.markup.escape()`，`Console(highlight=False)`。
+3. `--agent` 模式顶层就是 worker 自身，节点名是内部的 `model`/`tools` 而非角色名
+   → 打印时用 `label` 覆盖成角色名。
+4. `TavilySearch` **缺 key 时构造不报错、调用才报错**，所以必须自己判断 key 是否存在。
+
+---
+
+## v1 收尾状态（M0–M4 全部完成）
+
+计划中的 5 个里程碑已全部落地，`xx-code` 现在能：
+
+```bash
+python -m code_agent.cli --repo <仓库> "运行测试，把失败的修好"
+```
+
+→ Supervisor 自动调度 Explorer（定位）/ Coder（改码）/ Verifier（跑测试核验），
+高风险命令暂停等确认，会话由 PostgreSQL 持久化，可跨进程续接。
+
+### 已知未完成项（诚实清单，按优先级）
+
+1. **编排仍是方案 A（共享 messages）**。worker 偶尔会"照抄不动手"（M3 坑 7 已用指令注入
+   缓解，但没根治），上下文也会随任务变大而膨胀。→ 升级到方案 B（各 worker 独立
+   `findings`/`edits`/`verdict` 通道）是**下一步最大的收益点**。
+   升级时务必注意：**父子两侧 `state_schema` 必须同时声明通道**，否则静默丢弃。
+2. **图与调度的逻辑没有自动化测试**。目前 75 个单测覆盖的是纯函数（路径围栏 / 文件工具 /
+   搜索 / 危险命令识别 / web 开关）；supervisor 路由、子图接线、HITL 暂停-恢复
+   都只有手工验证记录。→ 需要引入 fake LLM 或录制回放来做集成测试。
+3. **`attempts` 上限（8）与 `recursion_limit`（250）是硬编码**，没有按任务规模自适应。
+4. **PG 连接失败没有友好报错**：`AGENT_PG_DSN` 指错或服务未启动时，会直接抛 psycopg 异常。
+5. **只支持 Windows + 中文环境验证过**（cp936、`taskkill`、`cmd.exe` 等假设）。
+6. **没有 `--resume` 之类的续接入口**：`--thread-id` 能续，但需要手动记住 ID。
 
 > 设计文档（含完整架构、工具清单、编排方式、压缩策略）保存在
 > `C:\Users\x_x\.claude\plans\crispy-forging-patterson.md`

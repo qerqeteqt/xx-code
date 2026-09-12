@@ -8,9 +8,11 @@
 
 ## 当前状态
 
-**M3 完成**：整条链路已打通 —— 给一句话任务，Supervisor 自动调度 Explorer / Coder / Verifier
-完成「定位 → 修改 → 验证」，高风险命令会暂停等你确认，会话由 PostgreSQL 持久化。
-70 个单测通过。
+**M0–M4 全部完成**（v1）：给一句话任务，Supervisor 自动调度 Explorer / Coder / Verifier
+完成「定位 → 修改 → 验证」，高风险命令会暂停等你确认，会话由 PostgreSQL 持久化，
+支持联网检索。75 个单测通过。
+
+> 已知未完成项与后续方向（编排升级、集成测试等）见 [DEVLOG.md](DEVLOG.md) 末尾的「v1 收尾状态」。
 
 ## 环境要求
 
@@ -60,13 +62,13 @@ xx-code/
 │   │   ├── filesystem.py   # read_file / write_file / edit_file / list_dir
 │   │   ├── search.py       # glob_search / grep_search
 │   │   ├── command.py      # run_command + 危险命令 HITL
-│   │   └── web.py          # 联网检索                     (M4)
+│   │   └── web.py          # web_search 联网检索（无 key 自动禁用）
 │   ├── workers.py       # Explorer / Coder / Verifier 三个 worker 子图
 │   ├── supervisor.py    # 中心调度（JSON 路由 + 指令注入）
 │   └── graph.py         # 组装 StateGraph + PostgreSQL checkpointer
 ├── data/                # 样例仓库等数据
 ├── models/              # 本地模型（暂空）
-├── tests/               # 单元测试（70 passed, 1 skipped）
+├── tests/               # 单元测试（75 passed, 1 skipped）
 ├── DEVLOG.md            # 开发日志：每步实际干了什么
 └── requirements.txt
 ```
@@ -79,7 +81,7 @@ xx-code/
 | M1 | 文件/搜索工具 + 单元测试（无需模型） | ✅ |
 | M2 | Explorer / Coder / Verifier 三个 worker | ✅ |
 | M3 | Supervisor 调度 + 危险命令 HITL 确认 | ✅ |
-| M4 | 联网检索 + 输出美化 + 完整文档 | ⏳ |
+| M4 | 联网检索 + 输出美化 + 完整文档 | ✅ |
 
 ## 设计要点
 

@@ -14,6 +14,9 @@ import sys
 import uuid
 
 from langchain_core.messages import AIMessage
+from rich.console import Console
+from rich.markup import escape
+from rich.panel import Panel
 
 from code_agent.messages import text_of
 
@@ -21,6 +24,16 @@ AGENT_ROLES = ("explorer", "coder", "verifier")
 
 # 图执行的步数上限（兜底，真正的轮次控制是 supervisor 的 attempts）
 RECURSION_LIMIT = 250
+
+# 各角色的配色，便于在 trace 里一眼分辨
+ROLE_STYLE = {
+    "supervisor": "bold cyan",
+    "explorer": "green",
+    "coder": "yellow",
+    "verifier": "magenta",
+}
+
+console = Console(highlight=False)
 
 
 def _fix_console_encoding() -> None:
@@ -37,10 +50,11 @@ def cmd_check(_args: argparse.Namespace) -> int:
     from code_agent.config import Settings, build_llm
 
     settings = Settings.from_env()
-    print(f"[1/3] 配置加载成功  ({settings.describe()})")
+    console.print(f"[1/3] 配置加载成功  ({settings.describe()})")
 
     llm = build_llm(settings)
-    print(f"[2/3] 文本调用成功  -> {text_of(llm.invoke('你是连通性测试。请只回复两个字：正常')).strip()!r}")
+    reply = text_of(llm.invoke("你是连通性测试。请只回复两个字：正常")).strip()
+    console.print(f"[2/3] 文本调用成功  -> {reply!r}")
 
     from langchain_core.tools import tool
 
@@ -49,16 +63,16 @@ def cmd_check(_args: argparse.Namespace) -> int:
         """原样返回传入的文本。"""
         return text
 
-    reply = llm.bind_tools([echo]).invoke(
+    result = llm.bind_tools([echo]).invoke(
         "请调用 echo 工具，把 text 参数设为 'tool-ok'，不要直接回答。"
     )
-    tool_calls = getattr(reply, "tool_calls", None) or []
+    tool_calls = getattr(result, "tool_calls", None) or []
     if not tool_calls:
-        print("[3/3] 失败：模型没有返回工具调用，该端点可能不支持 tool calling")
+        console.print("[red][3/3] 失败：模型没有返回工具调用，该端点可能不支持 tool calling[/]")
         return 2
 
-    print(f"[3/3] tool calling 正常  -> {json.dumps(tool_calls, ensure_ascii=False)}")
-    print("\n自检全部通过，环境可用。")
+    console.print(f"[3/3] tool calling 正常  -> {escape(json.dumps(tool_calls, ensure_ascii=False))}")
+    console.print("\n[bold green]自检全部通过，环境可用。[/]")
     return 0
 
 
@@ -68,6 +82,7 @@ def _print_update(node: str, update, seen: set | None = None) -> None:
     子图节点返回的状态里会带上它继承的整段共享历史，因此必须按消息 id 去重，
     否则会把上一个 agent 的动作误标到当前节点名下。
     """
+    style = ROLE_STYLE.get(node, "white")
     for message in (update or {}).get("messages", []) or []:
         if seen is not None:
             message_id = getattr(message, "id", None)
@@ -77,21 +92,25 @@ def _print_update(node: str, update, seen: set | None = None) -> None:
                 seen.add(message_id)
         for call in getattr(message, "tool_calls", None) or []:
             raw = json.dumps(call.get("args", {}), ensure_ascii=False)
-            print(f"[{node}] → {call.get('name')}({raw[:140]})")
+            console.print(
+                f"[{style}]{node:<10}[/][dim]→[/] {call.get('name')}"
+                f"[dim]({escape(raw[:140])})[/]"
+            )
 
 
 def _ask(interrupt_value) -> str:
     """危险命令的人工确认（HITL）。"""
-    print("\n" + "!" * 58)
-    print("需要你确认一条危险命令：")
-    print(f"  命令: {interrupt_value.get('command')}")
-    print(f"  原因: {interrupt_value.get('reason')}")
-    print(f"  目录: {interrupt_value.get('cwd')}")
+    body = (
+        f"命令: [bold]{escape(str(interrupt_value.get('command')))}[/]\n"
+        f"原因: {escape(str(interrupt_value.get('reason')))}\n"
+        f"目录: [dim]{escape(str(interrupt_value.get('cwd')))}[/]"
+    )
+    console.print(Panel(body, title="⚠ 需要确认危险命令", border_style="red"))
     try:
-        answer = input("  执行吗？[y/N] ").strip().lower()
+        answer = input("执行吗？[y/N] ").strip().lower()
     except EOFError:
         answer = ""  # 非交互环境（stdin 不可用）时按拒绝处理，安全优先
-    print("!" * 58)
+    console.print("[red]已拒绝[/]" if answer not in ("y", "yes") else "[green]已批准[/]")
     return "approve" if answer in ("y", "yes") else "reject"
 
 
@@ -106,10 +125,38 @@ def _final_answer(messages: list) -> str:
     return "(无输出)"
 
 
+def _stream_once(graph, payload, config, seen: set, label: str | None = None):
+    """跑一轮 stream；返回捕获到的 interrupt 值（没有则 None）。
+
+    label 用于把节点名统一显示成角色名（--agent 模式下顶层是 worker 自身，
+    节点名会是内部的 model/tools）。
+    """
+    for chunk in graph.stream(payload, config, stream_mode="updates"):
+        if "__interrupt__" in chunk:
+            return chunk["__interrupt__"][0].value
+        for node, update in chunk.items():
+            _print_update(label or node, update, seen)
+    return None
+
+
+def _drive(graph, payload, config, label: str | None = None) -> None:
+    """驱动图跑完，遇到危险命令就暂停询问，然后恢复。
+
+    `seen` 跨 resume 保留，否则中断恢复后会把中断前的消息重复打印。
+    """
+    from langgraph.types import Command
+
+    seen: set = set()
+    while True:
+        pending = _stream_once(graph, payload, config, seen, label)
+        if pending is None:
+            return
+        payload = Command(resume=_ask(pending))
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """完整模式：supervisor 调度三个 worker，PostgreSQL 持久化。"""
     from langchain_core.messages import HumanMessage
-    from langgraph.types import Command
 
     from code_agent.config import Settings
     from code_agent.graph import build_graph, open_checkpointer
@@ -119,58 +166,42 @@ def cmd_run(args: argparse.Namespace) -> int:
     root = RepoRoot(args.repo)
     thread_id = args.thread_id or uuid.uuid4().hex
 
-    print(f"[run] 仓库: {root}")
-    print(f"[run] 会话: {thread_id}")
-    print(f"[run] 任务: {args.task}")
+    console.print(f"[dim]仓库[/] {root}\n[dim]会话[/] {thread_id}\n[dim]任务[/] {args.task}")
 
     with open_checkpointer(settings.pg_dsn) as checkpointer:
         graph = build_graph(root, settings, checkpointer)
         config = {"configurable": {"thread_id": thread_id}, "recursion_limit": RECURSION_LIMIT}
-        payload: object = {"messages": [HumanMessage(args.task)], "attempts": 0}
+        _drive(graph, {"messages": [HumanMessage(args.task)], "attempts": 0}, config)
+        final = _final_answer(graph.get_state(config).values.get("messages", []))
 
-        seen: set = set()  # 跨 resume 保留，否则中断恢复后会把中断前的消息重复打印
-        while True:
-            pending = None
-            for chunk in graph.stream(payload, config, stream_mode="updates"):
-                if "__interrupt__" in chunk:
-                    pending = chunk["__interrupt__"][0].value
-                    break
-                for node, update in chunk.items():
-                    _print_update(node, update, seen)
-            if pending is None:
-                break
-            payload = Command(resume=_ask(pending))
-
-        print("-" * 58)
-        print(_final_answer(graph.get_state(config).values.get("messages", [])))
+    console.print(Panel(final, title="最终结论", border_style="green"))
     return 0
 
 
 def cmd_agent(args: argparse.Namespace) -> int:
-    """单 agent 模式：只运行指定的 worker。"""
+    """单 agent 模式：只运行指定的 worker。
+
+    单独运行时用 InMemorySaver，这样它调用危险命令也能正常暂停确认
+    （interrupt 必须要有 checkpointer）。
+    """
     from langchain_core.messages import HumanMessage
+    from langgraph.checkpoint.memory import InMemorySaver
 
     from code_agent.config import Settings
     from code_agent.paths import RepoRoot
     from code_agent.workers import build_worker
 
     root = RepoRoot(args.repo)
-    worker = build_worker(args.agent, root, Settings.from_env())
+    worker = build_worker(args.agent, root, Settings.from_env(), checkpointer=InMemorySaver())
 
-    print(f"[{args.agent}] 仓库: {root}")
-    print(f"[{args.agent}] 任务: {args.task}\n")
+    thread_id = args.thread_id or uuid.uuid4().hex
+    console.print(f"[dim]仓库[/] {root}\n[dim]任务[/] {args.task}")
 
-    final = None
-    config = {"configurable": {"thread_id": args.thread_id or uuid.uuid4().hex}}
-    payload = {"messages": [HumanMessage(args.task)]}
-    for chunk in worker.stream(payload, config, stream_mode="updates"):
-        for node, update in chunk.items():
-            _print_update(node, update)
-            for message in (update or {}).get("messages", []) or []:
-                final = message
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": RECURSION_LIMIT}
+    _drive(worker, {"messages": [HumanMessage(args.task)]}, config, label=args.agent)
+    final = _final_answer(worker.get_state(config).values.get("messages", []))
 
-    print("-" * 58)
-    print(text_of(final).strip() if final is not None else "(无输出)")
+    console.print(Panel(final, title=f"{args.agent} 输出", border_style=ROLE_STYLE.get(args.agent, "white")))
     return 0
 
 

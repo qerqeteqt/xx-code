@@ -5,7 +5,7 @@ system_prompt 与裁剪过的工具集（最小权限）。子图**不装 checkp
 持久化统一由根图（M3）负责 —— 子图自己装会冲突。
 
 工具权限（最小权限）：
-    Explorer   只读（list / read / glob / grep）
+    Explorer   只读（list / read / glob / grep）+ web_search（联网检索，未配 key 时自动禁用）
     Coder      只读 + 写（write / edit）
     Verifier   只读 + run_command —— 唯一能执行命令的角色，因此 HITL 只需挂在这一处
 """
@@ -25,6 +25,7 @@ from code_agent.paths import RepoRoot
 from code_agent.tools.command import build_command_tools
 from code_agent.tools.filesystem import build_filesystem_tools
 from code_agent.tools.search import build_search_tools
+from code_agent.tools.web import build_web_tools
 
 # 单个 agent 跑一轮任务的调用上限，防止跑飞
 MAX_MODEL_CALLS = 12
@@ -105,32 +106,42 @@ def _middleware() -> list:
 
 
 def _build(root: RepoRoot, name: str, prompt: str, *, allow_write: bool,
-           allow_command: bool, settings: Settings | None) -> object:
+           allow_command: bool, allow_web: bool, settings: Settings | None,
+           checkpointer=None) -> object:
+    settings = settings or Settings.from_env()
     tools = build_filesystem_tools(root, allow_write=allow_write) + build_search_tools(root)
     if allow_command:
         tools += build_command_tools(root)
+    if allow_web:
+        tools += build_web_tools(settings)
+
+    prompt_text = prompt.format(root=root)
+    if allow_web:
+        prompt_text += "\n\n需要外部资料（第三方库用法、报错含义、API 文档）时可用 web_search 联网检索。"
+
     return create_agent(
         build_llm(settings),
         tools=tools,
-        system_prompt=prompt.format(root=root) + _ACT_NOW,
+        system_prompt=prompt_text + _ACT_NOW,
         middleware=_middleware(),
+        checkpointer=checkpointer,
         name=name,
     )
 
 
-def build_explorer(root: RepoRoot, settings: Settings | None = None):
-    return _build(root, "explorer", _EXPLORER,
-                  allow_write=False, allow_command=False, settings=settings)
+def build_explorer(root: RepoRoot, settings: Settings | None = None, checkpointer=None):
+    return _build(root, "explorer", _EXPLORER, allow_write=False, allow_command=False,
+                  allow_web=True, settings=settings, checkpointer=checkpointer)
 
 
-def build_coder(root: RepoRoot, settings: Settings | None = None):
-    return _build(root, "coder", _CODER,
-                  allow_write=True, allow_command=False, settings=settings)
+def build_coder(root: RepoRoot, settings: Settings | None = None, checkpointer=None):
+    return _build(root, "coder", _CODER, allow_write=True, allow_command=False,
+                  allow_web=False, settings=settings, checkpointer=checkpointer)
 
 
-def build_verifier(root: RepoRoot, settings: Settings | None = None):
-    return _build(root, "verifier", _VERIFIER,
-                  allow_write=False, allow_command=True, settings=settings)
+def build_verifier(root: RepoRoot, settings: Settings | None = None, checkpointer=None):
+    return _build(root, "verifier", _VERIFIER, allow_write=False, allow_command=True,
+                  allow_web=False, settings=settings, checkpointer=checkpointer)
 
 
 WORKERS = {
@@ -140,8 +151,13 @@ WORKERS = {
 }
 
 
-def build_worker(role: str, root: RepoRoot, settings: Settings | None = None):
-    """按角色名构建 worker，返回编译后的子图。"""
+def build_worker(role: str, root: RepoRoot, settings: Settings | None = None,
+                 checkpointer=None):
+    """按角色名构建 worker，返回编译后的图。
+
+    checkpointer 只在**独立运行单个 worker**（CLI 的 --agent 模式）时传，
+    因为它要支持 HITL 暂停；作为父图子图嵌入时必须为 None。
+    """
     if role not in WORKERS:
         raise ValueError(f"未知角色: {role}（可选: {', '.join(WORKERS)}）")
-    return WORKERS[role](root, settings)
+    return WORKERS[role](root, settings, checkpointer)
