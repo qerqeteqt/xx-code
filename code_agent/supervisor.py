@@ -30,6 +30,11 @@ from code_agent.messages import text_of
 
 MAX_ATTEMPTS = 8
 
+# 喂给 supervisor 的摘要长度上限。交互模式下会话会越聊越长，
+# 不设上限的话摘要会无限膨胀（每轮都要重发，慢且贵）。
+# 超长时保留开头（原始任务）+ 结尾（最近的进展）。
+MAX_DIGEST_CHARS = 4000
+
 _EDIT_TOOLS = ("write_file", "edit_file")
 
 _SYSTEM = """你是 Supervisor，一个多 Agent 编码团队的调度者。
@@ -50,7 +55,19 @@ _SYSTEM = """你是 Supervisor，一个多 Agent 编码团队的调度者。
 
 只输出一个 JSON 对象，不要输出任何其他文字、不要用 markdown 代码块：
 {"next": "explorer" | "coder" | "verifier" | "finish", "reason": "一句话理由",
- "instruction": "交给该成员的具体指令，祈使句、直接可执行（finish 时留空字符串）"}"""
+ "instruction": "交给该成员的具体指令，祈使句、直接可执行（finish 时留空字符串）"}
+
+注意：**如果用户最后说的是提问，而不是要你干活**（例如"你刚才改了什么？""这个项目怎么跑测试？"），
+就应该选 finish，由你自己直接回答。"""
+
+
+_ANSWER = """你是 Supervisor，任务已告一段落，现在需要你**直接回复用户**。
+
+用简洁的中文回答用户最后提出的问题：
+- 用户是在提问就正面回答（可引用上文已有的结论）；
+- 刚才有成员完成了工作，就概括结果：改了什么、验证结论是什么。
+
+不要罗列工具调用细节，不要输出 JSON，直接说人话。"""
 
 
 class Route(BaseModel):
@@ -90,7 +107,12 @@ def _digest(messages: list) -> str:
             text = text_of(message).strip()
             if text:
                 lines.append(f"【汇报】{text[:600]}")
-    return "\n".join(lines) or "（暂无进展）"
+
+    digest = "\n".join(lines) or "（暂无进展）"
+    if len(digest) <= MAX_DIGEST_CHARS:
+        return digest
+    # 太长：保留第一行（最初的任务）与结尾（最近的进展）
+    return f"{lines[0]}\n…（中间记录已省略）\n{digest[-MAX_DIGEST_CHARS:]}"
 
 
 def _has_edits(messages: list) -> bool:
@@ -110,20 +132,45 @@ def _rule_based(messages: list, attempts: int) -> Route:
     return Route(next="verifier", reason="兜底：有改动，交给验证")
 
 
+def _answer_to_user(llm, digest: str, attempts: int) -> list:
+    """收尾时由 supervisor 直接给用户一个回答。
+
+    为什么需要它：三个 worker 都是工具驱动的，遇到"你刚才改了什么？"这类**提问**
+    没人能答 —— 若只是静默 END，CLI 会把上一轮的旧报告当成答案显示（实测如此）。
+    这里让模型生成真正的 AIMessage（不是手工构造，因此不违反思考模型的约束）。
+    """
+    try:
+        reply = llm.invoke([
+            SystemMessage(_ANSWER),
+            HumanMessage(f"{digest}\n\n请回复用户。"),
+        ])
+    except Exception:  # noqa: BLE001 - 回答失败也要能正常收尾
+        return []
+    if isinstance(reply, AIMessage):
+        # 用确定性 id：节点在 resume 后会重跑，靠 id 去重避免同一条回答被追加两次
+        reply.id = f"supervisor-answer-{attempts}"
+        return [reply]
+    return []
+
+
 def make_supervisor(llm, max_attempts: int = MAX_ATTEMPTS):
     """构建 supervisor 节点函数（返回 `Command` 直接路由，无需 conditional_edges）。"""
 
     def supervisor(state) -> Command:
         messages = state["messages"]
         attempts = state.get("attempts", 0) + 1
+        digest = _digest(messages)
 
         if attempts > max_attempts:
             print(f"[supervisor] 已达最大轮次 {max_attempts}，结束。")
-            return Command(goto=END, update={"attempts": attempts})
+            return Command(
+                goto=END,
+                update={"attempts": attempts, "messages": _answer_to_user(llm, digest, attempts)},
+            )
 
         prompt = [
             SystemMessage(_SYSTEM),
-            HumanMessage(f"{_digest(messages)}\n\n请决定下一步（只输出 JSON）。"),
+            HumanMessage(f"{digest}\n\n请决定下一步（只输出 JSON）。"),
         ]
         try:
             route = _parse_route(text_of(llm.invoke(prompt)))
@@ -133,13 +180,16 @@ def make_supervisor(llm, max_attempts: int = MAX_ATTEMPTS):
             route = _rule_based(messages, attempts - 1)
 
         print(f"[supervisor] 下一步 → {route.next}（{route.reason}）")
-        goto = END if route.next == "finish" else route.next
-        if goto == END:
-            return Command(goto=END, update={"attempts": attempts})
+        if route.next == "finish":
+            return Command(
+                goto=END,
+                update={"attempts": attempts, "messages": _answer_to_user(llm, digest, attempts)},
+            )
+
         # 以 HumanMessage 注入具体指令：给目标成员一个新鲜的祈使句。
         # 实测不这么做时，成员会看到上一位的结论而"照抄不动手"（方案 A 共享历史的固有代价）。
         # 用 HumanMessage 而非 AIMessage，是因为思考模型不允许手工构造 assistant 消息。
         directive = HumanMessage(f"[Supervisor 指令] {route.instruction or route.reason}")
-        return Command(goto=goto, update={"attempts": attempts, "messages": [directive]})
+        return Command(goto=route.next, update={"attempts": attempts, "messages": [directive]})
 
     return supervisor

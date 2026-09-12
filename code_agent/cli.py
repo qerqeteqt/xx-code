@@ -12,12 +12,14 @@ import argparse
 import json
 import sys
 import uuid
+from pathlib import Path
 
 from langchain_core.messages import AIMessage
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 
+from code_agent.config import PROJECT_ROOT
 from code_agent.messages import text_of
 
 AGENT_ROLES = ("explorer", "coder", "verifier")
@@ -35,14 +37,53 @@ ROLE_STYLE = {
 
 console = Console(highlight=False)
 
+# 记录"每个仓库最近一次的会话 id"，让 --chat 下次能自动续接上（短期记忆的一部分）。
+# 放在项目根、已被 .gitignore 排除，不会进版本库。
+SESSION_FILE = ".code_agent_sessions.json"
+
+
+def _session_path() -> Path:
+    return PROJECT_ROOT / SESSION_FILE
+
+
+def _load_last_session(repo: str) -> str | None:
+    try:
+        data = json.loads(_session_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None  # 文件不存在或损坏都当作"没有历史会话"
+    return data.get(repo)
+
+
+def _save_last_session(repo: str, thread_id: str) -> None:
+    path = _session_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    data[repo] = thread_id
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
 
 def _fix_console_encoding() -> None:
-    """Windows 控制台默认 cp936，强制 UTF-8 输出避免中文/符号报错。"""
-    for stream in (sys.stdout, sys.stderr):
+    """Windows 控制台默认 cp936，三个标准流都强制 UTF-8。
+
+    stdin 同样重要：交互模式下任务是从 stdin 读的（不是 argv）。重定向/管道时
+    stdin 会按 cp936 解码，中文会变成**代理字符**（如 '\\udca1'），
+    再发给模型 API 就会抛 `UnicodeEncodeError: surrogates not allowed`。
+    """
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
         except Exception:
             pass
+
+
+def _clean(text: str) -> str:
+    """清掉无法编码的代理字符（走 stdin 读中文时的残留）。
+
+    用户输入是系统边界，在这里兜一下，避免一个坏字符就让整轮任务崩掉。
+    """
+    return text.encode("utf-8", "replace").decode("utf-8")
 
 
 def cmd_check(_args: argparse.Namespace) -> int:
@@ -187,7 +228,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     from code_agent.paths import RepoRoot
 
     settings = Settings.from_env()
-    root = RepoRoot(args.repo)
+    root = RepoRoot(args.repo or ".")
     thread_id = args.thread_id or uuid.uuid4().hex
 
     console.print(f"[dim]仓库[/] {root}\n[dim]会话[/] {thread_id}\n[dim]任务[/] {args.task}")
@@ -216,7 +257,7 @@ def cmd_agent(args: argparse.Namespace) -> int:
     from code_agent.paths import RepoRoot
     from code_agent.workers import build_worker
 
-    root = RepoRoot(args.repo)
+    root = RepoRoot(args.repo or ".")
     worker = build_worker(args.agent, root, Settings.from_env(), checkpointer=InMemorySaver())
 
     thread_id = args.thread_id or uuid.uuid4().hex
@@ -230,6 +271,83 @@ def cmd_agent(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_chat(args: argparse.Namespace) -> int:
+    """交互模式：在同一个会话里连续对话，agent 记得上文（短期记忆）。
+
+    每轮输入都会把 `attempts` 重置为 0 —— 它是"本轮任务的调度次数上限"，
+    不是整个会话的上限；不重置的话聊几轮后就会被上限立刻结束。
+    """
+    from langchain_core.messages import HumanMessage
+
+    from code_agent.config import Settings
+    from code_agent.graph import build_graph, open_checkpointer
+    from code_agent.paths import RepoRoot
+
+    settings = Settings.from_env()
+
+    repo_arg = args.repo
+    if repo_arg is None:
+        try:
+            repo_arg = _clean(input("仓库路径 [.] : ")).strip() or "."
+        except EOFError:
+            repo_arg = "."
+    root = RepoRoot(repo_arg)
+
+    thread_id = args.thread_id
+    resumed = False
+    if thread_id is None and not args.new:
+        thread_id = _load_last_session(str(root))
+        resumed = thread_id is not None
+    thread_id = thread_id or uuid.uuid4().hex
+
+    _check_pg(settings.pg_dsn)
+    console.print(f"[dim]仓库[/] {root}")
+    console.print(
+        f"[dim]会话[/] {thread_id}"
+        + ("  [green]（已续接上次会话）[/]" if resumed else "  [dim]（新会话）[/]")
+    )
+    console.print("[dim]直接输入任务即可；[/][cyan]:new[/][dim] 开新会话，[/][cyan]:q[/][dim] 退出[/]\n")
+
+    with open_checkpointer(settings.pg_dsn) as checkpointer:
+        graph = build_graph(root, settings, checkpointer)
+        _save_last_session(str(root), thread_id)
+
+        while True:
+            try:
+                line = _clean(input(">>> ")).strip()
+            except (EOFError, KeyboardInterrupt):
+                console.print()
+                break
+            if not line:
+                continue
+            if line in (":q", ":quit", "exit", "quit"):
+                break
+            if line == ":new":
+                thread_id = uuid.uuid4().hex
+                _save_last_session(str(root), thread_id)
+                console.print(f"[dim]已开新会话[/] {thread_id}\n")
+                continue
+
+            config = {
+                "configurable": {"thread_id": thread_id},
+                "recursion_limit": RECURSION_LIMIT,
+            }
+            payload = {"messages": [HumanMessage(line)], "attempts": 0}
+
+            try:
+                _drive(graph, payload, config)
+            except RuntimeError as exc:
+                # 单轮出错不该终结整个会话
+                console.print(f"[red]本轮出错：[/]{escape(str(exc))}\n")
+                continue
+
+            final = _final_answer(graph.get_state(config).values.get("messages", []))
+            console.print(Panel(final, title="最终结论", border_style="green"))
+
+    console.print("[dim]会话结束。[/]")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="code_agent",
@@ -237,8 +355,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("task", nargs="?", help="任务描述（自然语言）")
     parser.add_argument(
-        "--repo", metavar="PATH", default=".", help="目标仓库路径（默认当前目录）"
+        "--repo", metavar="PATH", default=None, help="目标仓库路径（默认当前目录）"
     )
+    parser.add_argument(
+        "--chat", action="store_true", help="交互模式：连续对话，agent 记得上文"
+    )
+    parser.add_argument("--new", action="store_true", help="交互模式下强制开新会话")
     parser.add_argument(
         "--agent", choices=AGENT_ROLES, help="只运行单个 worker，而不是完整调度"
     )
@@ -256,11 +378,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check:
         return cmd_check(args)
-    if not args.task:
-        parser.print_help()
-        return 0
 
     try:
+        if args.chat:
+            return cmd_chat(args)
+        if not args.task:
+            parser.print_help()
+            return 0
         if args.agent:
             return cmd_agent(args)
         return cmd_run(args)

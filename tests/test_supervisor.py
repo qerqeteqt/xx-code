@@ -11,9 +11,11 @@ from langgraph.graph import END
 from code_agent.supervisor import make_supervisor
 
 
-def _route(model, content, *, attempts: int = 0, extra: list | None = None,
+def _route(model, *contents: str, attempts: int = 0, extra: list | None = None,
            max_attempts: int = 8):
-    llm = model([AIMessage(content=content)])
+    """注意：收尾（finish / 到达上限）时 supervisor 会**再调一次模型**生成给用户的回答，
+    所以那些用例要传两个 contents（第一个是路由 JSON，第二个是回答）。"""
+    llm = model([AIMessage(content=c) for c in contents])
     messages = [HumanMessage("任务"), *(extra or [])]
     return make_supervisor(llm, max_attempts=max_attempts)(
         {"messages": messages, "attempts": attempts}
@@ -25,7 +27,8 @@ def test_json_route_to_coder(scripted):
 
 
 def test_finish_maps_to_end(scripted):
-    assert _route(scripted, '{"next": "finish", "reason": "done"}').goto == END
+    cmd = _route(scripted, '{"next": "finish", "reason": "done"}', "已完成")
+    assert cmd.goto == END
 
 
 def test_instruction_is_injected_as_human_message(scripted):
@@ -39,9 +42,19 @@ def test_instruction_is_injected_as_human_message(scripted):
     assert "把 add 改成加法" in injected[0].content
 
 
-def test_finish_does_not_inject_message(scripted):
-    cmd = _route(scripted, '{"next": "finish", "reason": "done"}')
-    assert "messages" not in cmd.update
+def test_finish_produces_user_facing_answer(scripted):
+    """收尾时必须给用户一个回答。
+
+    三个 worker 都是工具驱动的，遇到"你刚才改了什么？"这类提问没人能答；
+    若只是静默 END，CLI 会把上一轮的旧报告当成答案显示（实测踩到过）。
+    """
+    cmd = _route(scripted, '{"next": "finish", "reason": "done"}', "改了 calc.py")
+    assert cmd.goto == END
+    reply = cmd.update["messages"][0]
+    assert isinstance(reply, AIMessage)
+    assert "改了 calc.py" in reply.content
+    # 确定性 id：节点在 resume 后会重跑，靠 id 去重避免同一条回答被追加两次
+    assert reply.id.startswith("supervisor-answer-")
 
 
 def test_invalid_json_falls_back_to_rules(scripted):
@@ -66,10 +79,33 @@ def test_model_exception_falls_back_to_rules(scripted):
 
 
 def test_attempts_cap_ends_graph(scripted):
-    cmd = _route(scripted, '{"next": "coder", "reason": "r"}', attempts=8, max_attempts=8)
+    cmd = _route(scripted, '{"next": "coder", "reason": "r"}', "已尽力，结束",
+                 attempts=8, max_attempts=8)
     assert cmd.goto == END
 
 
 def test_attempts_increments(scripted):
     cmd = _route(scripted, '{"next": "coder", "reason": "r"}', attempts=2)
     assert cmd.update["attempts"] == 3
+
+
+def test_attempts_is_a_per_turn_counter(scripted):
+    """attempts 约束的是"本轮任务"，不是整个会话。
+
+    CLI 每轮用户输入都会把它重置为 0；不重置的话，交互模式下聊几轮之后
+    状态里残留的 attempts 会让新一轮一开始就被上限结束。
+    """
+    assert _route(scripted, '{"next": "coder"}', attempts=8).goto == END
+    assert _route(scripted, '{"next": "coder"}', attempts=0).goto == "coder"
+
+
+def test_digest_is_bounded(scripted):
+    """会话越聊越长，喂给 supervisor 的摘要必须有长度上限（否则每轮都变慢变贵）。"""
+    from code_agent.supervisor import MAX_DIGEST_CHARS, _digest
+
+    messages = [HumanMessage("最初的任务")] + [AIMessage(content="汇报" * 300) for _ in range(20)]
+    digest = _digest(messages)
+
+    assert len(digest) <= MAX_DIGEST_CHARS + 100
+    assert "最初的任务" in digest, "开头的原始任务应被保留"
+    assert "已省略" in digest

@@ -511,6 +511,86 @@ X start +0.00 / Y start +0.00 / X end +0.60 / Y end +0.60   总耗时 0.61s（�
 
 ---
 
+## 新增 — 交互模式与短期记忆（2026-09-13）
+
+### 目标
+
+把 `xx-code` 从"一次性批处理"变成**可以对话的 agent**，并让它记住上文 ——
+原先只能 `python -m code_agent.cli --repo X "任务"` 跑完即退出，不能追问。
+
+### 改动
+
+| 文件 | 说明 |
+|---|---|
+| `code_agent/cli.py` | 新增 `--chat` 交互模式、`--new`；会话记录（每个仓库最近一次会话）；`_clean()`；stdin 也强制 UTF-8 |
+| `code_agent/supervisor.py` | **收尾时产出面向用户的回答**；摘要加 4000 字符上限 |
+| `pyproject.toml` | 新增 `xx-code` 命令入口（需 `pip install -e .`） |
+| `.gitignore` | 忽略 `.code_agent_sessions.json` |
+| `tests/test_chat_session.py` | 新增 5 例（会话记录的存取/覆盖/损坏恢复） |
+| `tests/test_supervisor.py` | 更新 finish 断言 + 摘要上限 + `attempts` 逐轮语义 |
+
+设计要点：
+
+- **短期记忆 = 同一个 `thread_id` 贯穿会话**，消息由 `PostgresSaver` 持久化；
+  三个 worker 通过共享 `messages` 黑板自然看到上文。
+- **跨次记忆**：记录"每个仓库最近一次会话"，`--chat` 下次自动续接（`:new` 开新会话）。
+- **`attempts` 逐轮重置**：每轮输入传 `attempts=0`。它是"本轮任务的调度次数上限"，
+  不是整个会话的上限 —— 不重置的话续聊时新一轮会被立刻结束。
+
+### 验证
+
+```bash
+"C:\Users\x_x\.conda\envs\langgraph\python.exe" -m pytest
+# => 98 passed, 1 skipped
+```
+
+**多轮对话（同一会话内追问）**：
+
+```
+>>> 运行测试，把失败的修好
+[supervisor] → verifier → coder → verifier → finish      ← 修好 calc.py 的 2 个 bug
+>>> 你刚才改了哪个文件？改了什么？凭记忆直接回答。
+[supervisor] 下一步 → finish（用户最后是在提问，而非继续干活）
+>>> 改的是 data/sample_repo/calc.py，只动了这一个文件…add 改成加法、div 加了除零判断
+```
+
+**跨次记忆（新进程、不加 `--new`）**：
+
+```
+会话 48a03a09…（已续接上次会话）
+>>> 我之前让你改的是哪个文件？改了什么？
+→ 改的是 data/sample_repo/calc.py，只动了这一个文件…（凭记忆作答，未重新调查）
+```
+
+### 备注与坑
+
+1. **stdin 没强制 UTF-8 → 中文变成代理字符 → API 直接报错**。
+   `UnicodeEncodeError: 'utf-8' codec can't encode character '\udca1' ... surrogates not allowed`。
+   一次性模式的任务来自 `sys.argv`（Windows 宽字符 API 解码，中文正常），所以一直没暴露；
+   交互模式从 **stdin** 读，管道/重定向时会按 cp936 解码 → 产生代理字符。
+   → 三个标准流都强制 UTF-8，并在输入边界加 `_clean()` 清掉代理字符。
+2. **这个图原本不会"回答问题"**。三个 worker 都是工具驱动的，supervisor 只会派活；
+   用户问"你刚才改了什么"时它直接 `finish`，CLI 于是把**上一轮的旧报告**当作答案显示 ——
+   表现成"答非所问、内容是旧的"。
+   → 让 supervisor 在收尾时**自己生成回答**（用模型生成的真实 `AIMessage`，
+   不是手工构造，因此不违反思考模型的约束），并用**确定性 id** 防 resume 时重复追加。
+   同时在路由提示里写明"用户是在提问而非派活时应选 finish 并直接回答"。
+3. **`attempts` 原本跨轮累积**：续聊时状态里残留的计数会让新一轮立刻被上限结束。
+   → 每轮输入传 `attempts=0`，并用测试把该语义固定下来
+   （`test_attempts_is_a_per_turn_counter`）。
+4. **共享历史的交叉污染（方案 A 的实证）**：实测 **coder 模仿 verifier 调用了 `run_command`**
+   —— 一个它根本没有的工具。ToolNode 返回
+   `Error: run_command is not a valid tool, try one of [list_dir, read_file, write_file, edit_file, glob_search, grep_search]`。
+   **安全没被突破**（工具 schema + ToolNode 拦住了），但白费一次模型调用。
+   → 先在 worker 提示词里写明"你不能执行命令/不能改文件"，缓解这个问题；
+   **根本解法仍是方案 B**（各 worker 独立通道，不共享原始对话）。
+5. supervisor 的摘要加了 4000 字符上限（保留开头任务 + 结尾进展）。
+   交互模式下会话会越来越长，不设上限的话每轮都变慢变贵。
+6. `xx-code` 命令入口写在 `pyproject.toml` 里，但**没有自动安装** ——
+   需要时自己跑一次 `pip install -e .`（依赖刻意声明为空，不会改动现有环境）。
+
+---
+
 ## v1 收尾状态（M0–M4 全部完成）
 
 计划中的 5 个里程碑已全部落地，`xx-code` 现在能：

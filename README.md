@@ -69,18 +69,29 @@ python -m code_agent.cli --check
 # 4. 运行测试
 python -m pytest
 
-# 5. 练手：拿自带靶子跑（data/sample_repo 有 2 个故意留的失败用例）
-python -m code_agent.cli --repo data/sample_repo "运行测试，把失败的修好"
-git diff data/sample_repo          # 看它改了什么
-git checkout -- data/sample_repo   # 一键还原，可反复练
+# 5. 【推荐】交互模式：可以连续对话，agent 记得上文
+python -m code_agent.cli --chat --repo data/sample_repo
+#    >>> 运行测试，把失败的修好
+#    >>> 你刚才改了哪个文件？        ← 它会凭记忆回答，不用重述背景
+#    >>> :new   开新会话      >>> :q   退出
+#    会话由 PostgreSQL 持久化；下次进 --chat 会自动续接本仓库上次的会话
 
-# 6. 完整模式：Supervisor 调度三个 worker 自动完成任务
+# 6. 一次性模式：跑完即退出
 python -m code_agent.cli --repo <目标仓库路径> "任务描述"
 #    会打印调度决策与各 agent 的工具调用；危险命令会暂停等你输入 y/N
 
 # 7. 单 agent 模式：只跑一个 worker
 python -m code_agent.cli --repo . --agent explorer "简要说明这个项目的模块划分"
 #    --agent 可选 explorer / coder / verifier；coder 会真实修改文件，注意目标仓库
+```
+
+### 可选：装一个短命令
+
+想以后直接敲 `xx-code` 而不是 `python -m code_agent.cli`：
+
+```bash
+pip install -e .        # 只安装本项目，不会改动环境里已有的依赖
+xx-code --chat --repo data/sample_repo
 ```
 
 > ⚠️ 只在 **git 干净、你不在乎搞坏**的仓库上跑修改类任务。危险命令的拦截是
