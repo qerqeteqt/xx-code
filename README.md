@@ -8,7 +8,8 @@
 
 ## 当前状态
 
-**M0 完成**：项目骨架与模型自检通过。**尚无实际编码功能**，见下方路线图。
+**M1 完成**：项目骨架、模型自检、文件/搜索工具均已就绪（40 个单测通过）。
+**尚无 Agent 编排**，见下方路线图。
 
 ## 环境要求
 
@@ -30,6 +31,9 @@ cp .env.example .env
 
 # 3. 自检：验证模型连通与 tool calling
 python -m code_agent.cli --check
+
+# 4. 运行单元测试
+python -m pytest
 ```
 
 ## 目录结构
@@ -39,15 +43,20 @@ xx-code/
 ├── code_agent/          # 主包
 │   ├── config.py        # 配置加载 + 模型构建
 │   ├── cli.py           # 命令行入口
-│   ├── paths.py         # 目标仓库路径围栏          (M1)
+│   ├── paths.py         # 目标仓库路径围栏
+│   ├── tools/           # 工具集
+│   │   ├── _util.py        # safe：工具异常兜底
+│   │   ├── filesystem.py   # read_file / write_file / edit_file / list_dir
+│   │   ├── search.py       # glob_search / grep_search
+│   │   ├── command.py      # run_command + 危险命令 HITL   (M3)
+│   │   └── web.py          # 联网检索                     (M4)
 │   ├── state.py         # 共享 State 定义            (M2)
-│   ├── tools/           # 文件 / 搜索 / 命令 / 联网工具 (M1)
 │   ├── workers.py       # Explorer / Coder / Verifier (M2)
 │   ├── supervisor.py    # 中心调度                   (M3)
 │   └── graph.py         # 组装 StateGraph            (M3)
 ├── data/                # 样例仓库等数据
 ├── models/              # 本地模型（暂空）
-├── tests/               # 单元测试
+├── tests/               # 单元测试（40 passed）
 ├── DEVLOG.md            # 开发日志：每步实际干了什么
 └── requirements.txt
 ```
@@ -57,7 +66,7 @@ xx-code/
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
 | M0 | 项目骨架 + 模型自检 | ✅ |
-| M1 | 文件/搜索工具 + 单元测试（无需模型） | ⏳ |
+| M1 | 文件/搜索工具 + 单元测试（无需模型） | ✅ |
 | M2 | Explorer / Coder / Verifier 三个 worker | ⏳ |
 | M3 | Supervisor 调度 + 危险命令 HITL 确认 | ⏳ |
 | M4 | 联网检索 + 输出美化 + 完整文档 | ⏳ |

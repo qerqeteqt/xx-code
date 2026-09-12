@@ -69,14 +69,78 @@ cd D:\pycharm\Mutil-Agent
 
 ---
 
+## M1 — 文件与搜索工具（2026-09-12）
+
+### 目标
+
+落地所有文件/搜索工具，并**在不依赖模型的情况下**用单元测试验证。核心是安全（路径围栏）与稳定（工具不抛异常、输出有截断）。
+
+### 改动
+
+| 文件 | 说明 |
+|---|---|
+| `code_agent/paths.py` | `RepoRoot` 路径围栏：`resolve()` 越界抛 `PathEscapeError` |
+| `code_agent/tools/_util.py` | `safe` 装饰器：工具任何异常都转成 `Error: ...` 字符串返回 |
+| `code_agent/tools/filesystem.py` | `list_dir` / `read_file` / `write_file` / `edit_file` |
+| `code_agent/tools/search.py` | `glob_search` / `grep_search`（**自研**，见坑 1） |
+| `code_agent/tools/__init__.py` | 工具层说明 |
+| `tests/test_paths.py` | 围栏单测（含 `..` 逃逸、绝对路径越界、虚拟路径） |
+| `tests/test_filesystem.py` | 文件工具单测（含截断、`old_string` 不唯一、越界拦截） |
+| `tests/test_search.py` | 搜索工具单测（含中文文件回归） |
+| `pytest.ini` | `testpaths=tests`、`pythonpath=.`、`-q` |
+
+设计要点：
+- **最小权限**：`build_filesystem_tools(root, allow_write=False)` 给 Explorer 只读工具集；写类工具只给 Coder。
+- **源头截断**（第一层上下文压缩）：`read_file` 最多 400 行、`list_dir` 最多 200 项、`grep_search` 最多 100 条。
+- **搜索结果路径可直接回传**：`grep_search` 返回 `code_agent/config.py:65:...`，其中路径可直接喂给 `read_file`（已实测）。
+- `grep_search` 跳过 `.git` / `__pycache__` / `node_modules` 等目录与二进制文件。
+
+### 验证
+
+```bash
+"C:\Users\x_x\.conda\envs\langgraph\python.exe" -m pytest
+# => 40 passed
+```
+
+真实项目自测（仓库里全是中文注释，正好是回归场景）：
+
+```
+[glob] **/*.py        -> code_agent/__init__.py | code_agent/cli.py | ... (11 个)
+[grep] def build_llm  -> code_agent/config.py:65:def build_llm(settings: Settings | None = None, ...
+[grep] 上下文压缩      -> code_agent/tools/filesystem.py:17 ... / README.md:69 ...   ← 中文检索正常
+[read] 用 grep 结果路径读取 -> 成功
+```
+
+### 备注与坑
+
+1. **⚠️ 内置 `FilesystemFileSearchMiddleware` 在 Windows 上有编码 bug，已弃用。**
+   它的纯 Python 回退（本机无 ripgrep，必走这条）用 `file_path.read_text()` **不带 encoding**，
+   Windows 默认 cp936，遇到含中文的 UTF-8 文件抛 `UnicodeDecodeError` 后被
+   `except (UnicodeDecodeError, PermissionError): continue` **静默跳过**。
+   实测：纯 ASCII 文件能搜到，含中文的一律搜不到 —— 对中文代码库等于搜索报废。
+   → 因此 `tools/search.py` 改为**自研**，显式 `encoding="utf-8", errors="replace"`，
+   并顺带解决下面第 2 条、加上截断与忽略目录。
+2. 内置中间件返回的是 `"/code_agent\cli.py"` 这种**带前导斜杠、夹杂反斜杠的虚拟路径**，
+   直接回传给 `read_file` 会被当成绝对路径 → 判定越界。
+   → `RepoRoot.resolve()` 现在把**无盘符的前导斜杠**按"仓库根相对"解释；自研搜索直接返回干净
+   的 POSIX 相对路径，两边都对齐了。
+3. `safe` 装饰器是硬性要求：`create_agent` 默认只吞参数校验错误，工具体里的其他异常会
+   **冒泡崩掉整个 run**。所以每个工具都必须保证不抛异常。
+4. `RepoRoot` 的安全性依赖 `Path.resolve()` 会展开 `..` 并跟随符号链接，因此指向仓库外的
+   符号链接也会被正确拒绝。
+
+---
+
 ## 下一步
 
-**M1 — 文件与搜索工具（不需要模型即可测试）**
+**M2 — 三个 worker 子图**
 
-- `code_agent/paths.py`：`RepoRoot` 路径围栏（`resolve()` + 校验是否在根内，防目录穿越）
-- `code_agent/tools/filesystem.py`：`read_file` / `write_file` / `edit_file` / `list_dir`
-- `code_agent/tools/search.py`：复用 `FilesystemFileSearchMiddleware`（`use_ripgrep=False`）
-- `tests/`：路径围栏与工具的单测，`pytest` 验证
+- `code_agent/state.py`：`OverallState`（`MessagesState` + `attempts`）
+- `code_agent/workers.py`：用 `create_agent` 构建 Explorer / Coder / Verifier
+  - 各自独立 `system_prompt` + **裁剪过的工具集**（注意参数是 `system_prompt=`，不是 `prompt=`）
+  - **子图不装 checkpointer**（只有根图装）
+- 中间件：`ContextEditingMiddleware`（清旧工具结果）、`ToolRetryMiddleware(on_failure="continue")`、`ToolCallLimitMiddleware`
+- 验证：单个 worker 能独立跑通一轮"读文件 → 回答"的工具调用
 
 > 设计文档（含完整架构、工具清单、编排方式、压缩策略）保存在
 > `C:\Users\x_x\.claude\plans\crispy-forging-patterson.md`
