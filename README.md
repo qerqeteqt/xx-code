@@ -23,6 +23,36 @@
 
 ## 快速开始
 
+### 0. 先选对 python（重要）
+
+项目跑在 conda env `langgraph` 里，**不能用系统默认的 python**（那是 3.10，没装依赖）。
+
+**方式 A（推荐）——先激活环境，之后命令都短：**
+
+```powershell
+conda activate langgraph
+python -m code_agent.cli --check
+```
+
+**方式 B ——不激活，直接用该环境的 python（绝对路径）：**
+
+```powershell
+# PowerShell（注意 & 前缀，否则报"意外的标记 -m"）
+& "C:\Users\x_x\.conda\envs\langgraph\python.exe" -m code_agent.cli --check
+```
+
+```cmd
+:: cmd.exe（不需要 &）
+"C:\Users\x_x\.conda\envs\langgraph\python.exe" -m code_agent.cli --check
+```
+
+```bash
+# git bash
+"C:\Users\x_x\.conda\envs\langgraph\python.exe" -m code_agent.cli --check
+```
+
+### 步骤
+
 ```bash
 # 1. 安装依赖
 pip install -r requirements.txt
@@ -36,17 +66,25 @@ cp .env.example .env
 # 3. 自检：验证模型连通与 tool calling
 python -m code_agent.cli --check
 
-# 4. 运行单元测试
+# 4. 运行测试
 python -m pytest
 
-# 5. 完整模式：Supervisor 调度三个 worker 自动完成任务
-python -m code_agent.cli --repo <目标仓库路径> "运行测试，把失败的修好"
-#    过程会打印调度决策与各 agent 的工具调用；危险命令会暂停等你输入 y/N
+# 5. 练手：拿自带靶子跑（data/sample_repo 有 2 个故意留的失败用例）
+python -m code_agent.cli --repo data/sample_repo "运行测试，把失败的修好"
+git diff data/sample_repo          # 看它改了什么
+git checkout -- data/sample_repo   # 一键还原，可反复练
 
-# 6. 单 agent 模式：只跑一个 worker
+# 6. 完整模式：Supervisor 调度三个 worker 自动完成任务
+python -m code_agent.cli --repo <目标仓库路径> "任务描述"
+#    会打印调度决策与各 agent 的工具调用；危险命令会暂停等你输入 y/N
+
+# 7. 单 agent 模式：只跑一个 worker
 python -m code_agent.cli --repo . --agent explorer "简要说明这个项目的模块划分"
 #    --agent 可选 explorer / coder / verifier；coder 会真实修改文件，注意目标仓库
 ```
+
+> ⚠️ 只在 **git 干净、你不在乎搞坏**的仓库上跑修改类任务。危险命令的拦截是
+> **正则匹配而非沙箱**，绕不过去的场景请自己判断。
 
 ## 目录结构
 

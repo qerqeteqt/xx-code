@@ -446,6 +446,12 @@ verifier  → run_command(pytest) / run_command(边界抽查) / read_file ×2
    Verifier 多花了约 8 次工具调用去排查"测试到底在哪"。
    → 给 `sample_repo` 加了它自己的 `pytest.ini`，使其成为**自包含**的仓库。
    （对真实仓库同理：把 `--repo` 指向大项目的子目录时，可能遇到同类的配置继承问题。）
+5. **文档里的命令是按 bash 写的，但用户实际用 PowerShell** —— PowerShell 里
+   `"路径" 参数` 会被解析成表达式，报 `表达式或语句中包含意外的标记 "-m"`，
+   必须写成 `& "路径" 参数`（调用运算符）。
+   → README「快速开始」补了 PowerShell / cmd / git bash 三种写法，
+   并推荐 `conda activate langgraph`（用户的 PowerShell 已初始化 conda，实测可用）。
+   **教训：写命令示例前先确认用户用的是什么 shell。**
 
 ---
 
