@@ -34,6 +34,10 @@ python -m code_agent.cli --check
 
 # 4. 运行单元测试
 python -m pytest
+
+# 5. （可选）看工具实际效果：写入 → 读取 → 替换 → 搜索 → 越界拦截
+#    全程在临时目录，不会修改任何真实文件
+python -m code_agent.cli --demo-tools
 ```
 
 ## 目录结构

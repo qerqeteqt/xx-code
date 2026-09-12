@@ -100,6 +100,10 @@ cd D:\pycharm\Mutil-Agent
 ```bash
 "C:\Users\x_x\.conda\envs\langgraph\python.exe" -m pytest
 # => 40 passed
+
+# 工具演示：写入 → 读取 → 精确替换 → 列目录 → glob → grep → 越界拦截
+# 全程在临时目录，不会修改任何真实文件
+"C:\Users\x_x\.conda\envs\langgraph\python.exe" -m code_agent.cli --demo-tools
 ```
 
 真实项目自测（仓库里全是中文注释，正好是回归场景）：
