@@ -101,9 +101,9 @@ cd D:\pycharm\Mutil-Agent
 "C:\Users\x_x\.conda\envs\langgraph\python.exe" -m pytest
 # => 40 passed
 
-# 工具演示：写入 → 读取 → 精确替换 → 列目录 → glob → grep → 越界拦截
-# 全程在临时目录，不会修改任何真实文件
-"C:\Users\x_x\.conda\envs\langgraph\python.exe" -m code_agent.cli --demo-tools
+# 注：当时还加过一个 `--demo-tools` 命令（在临时目录里演示写入/读取/替换/搜索/越界拦截）
+# 用于手动验证。M2 时按「不为测试加脚手架、代码尽量简洁」的要求**已删除**该命令，
+# 上述场景现由 tests/ 下的单测覆盖。
 ```
 
 真实项目自测（仓库里全是中文注释，正好是回归场景）：
@@ -155,6 +155,7 @@ cd D:\pycharm\Mutil-Agent
 
 - **最小权限**：Explorer 只读；Coder 只读 + `write_file`/`edit_file`；Verifier 只读（M3 加 `run_command`）。
 - 三个 worker 共用中间件：`ContextEditingMiddleware`（清旧工具结果）+ `ToolRetryMiddleware(on_failure="continue")` + `ToolCallLimitMiddleware(run_limit=25)` + `ModelCallLimitMiddleware(run_limit=12)`。
+  （`ToolRetryMiddleware` 在 **M3 已移除** —— 它会吞掉 `interrupt()` 导致 HITL 失效，见 M3 节坑 4。）
 - **worker 子图不装 checkpointer**，持久化统一留给根图（M3）。
 - 每个 worker 是 `create_agent(...)` 编译出的独立子图，可直接 `stream()` 运行。
 - **主动跳过计划里的 `state.py`**：单 worker 用不到，等 M3 组图时再加，不留无人使用的代码。
@@ -304,6 +305,20 @@ python -m code_agent.cli --repo D:/tmp_m3_final2 "运行测试，把失败的修
 
 9. Windows 上 `subprocess` 的 `start_new_session` 是**无效参数**，超时杀进程必须用
    `taskkill /F /T /PID` 带走整棵进程树。
+
+10. **supervisor 起初不知道成员的能力边界，会把任务派给没有相应工具的成员**。
+    实测它把「执行命令」派给了 coder（coder 确实没有 `run_command`），coder 如实拒绝后
+    supervisor 就直接 `finish`，HITL 根本没机会触发。
+    → 在 supervisor 系统提示里写明**能力矩阵**（只有 verifier 能执行命令、只有 coder 能改代码），
+    并要求「结束前确认没有把任务派给不具备相应能力的成员」。
+    - 附带发现：期间模型还**幻觉过自己的工具集** —— verifier 声称自己只有 6 个文件工具、
+      没有 `run_command`，而它在同一轮明明调用过 `run_command`。
+      说明"能力边界"不能指望模型自省，必须在提示里显式声明。
+
+11. **worker 需要一条通用约束**：ReAct 循环在模型「只回文字、不调工具」时就会结束，
+    实测 coder 曾只描述计划而不动手。
+    → `workers._build()` 给三个 worker 的 system_prompt 统一追加 `_ACT_NOW`：
+    不要只描述计划、必须实际调用工具推进任务、只有任务确实完成才输出最终汇报。
 
 ---
 
