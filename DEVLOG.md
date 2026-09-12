@@ -425,7 +425,9 @@ python -m code_agent.cli --repo <仓库> "运行测试，把失败的修好"
    搜索 / 危险命令识别 / web 开关）；supervisor 路由、子图接线、HITL 暂停-恢复
    都只有手工验证记录。→ 需要引入 fake LLM 或录制回放来做集成测试。
 3. **`attempts` 上限（8）与 `recursion_limit`（250）是硬编码**，没有按任务规模自适应。
-4. **PG 连接失败没有友好报错**：`AGENT_PG_DSN` 指错或服务未启动时，会直接抛 psycopg 异常。
+4. ~~PG 连接失败没有友好报错~~ → **已修**：CLI 加了 `_check_pg()` 预检，`main()` 统一捕获
+   `RuntimeError` 并打印人话提示（同时覆盖"缺少 `AGENT_PG_DSN`"）。原先会甩出一长串 psycopg
+   堆栈，其中 PG 返回的中文报错还会因控制台编码变成乱码。
 5. **只支持 Windows + 中文环境验证过**（cp936、`taskkill`、`cmd.exe` 等假设）。
 6. **没有 `--resume` 之类的续接入口**：`--thread-id` 能续，但需要手动记住 ID。
 

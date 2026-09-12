@@ -154,6 +154,30 @@ def _drive(graph, payload, config, label: str | None = None) -> None:
         payload = Command(resume=_ask(pending))
 
 
+def _check_pg(dsn: str | None) -> None:
+    """提前验证 PostgreSQL 可连。
+
+    否则连接失败时用户会看到一长串 psycopg 堆栈（其中 PG 返回的中文报错还可能因
+    控制台编码问题变成乱码）。这里转成一句人话。
+    """
+    if not dsn:
+        raise RuntimeError("缺少 AGENT_PG_DSN，请参考 .env.example 配置后再运行。")
+
+    import psycopg
+
+    try:
+        with psycopg.connect(dsn, connect_timeout=5):
+            return
+    except Exception as exc:  # noqa: BLE001 - 统一转成友好提示
+        raise RuntimeError(
+            "无法连接 PostgreSQL。请确认：\n"
+            "  1) 服务已启动（Get-Service *postgres*）\n"
+            "  2) .env 里的 AGENT_PG_DSN 用户名/密码/库名正确\n"
+            "  3) 数据库 langgraph_db 存在\n"
+            f"  （底层错误类型：{type(exc).__name__}）"
+        ) from exc
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """完整模式：supervisor 调度三个 worker，PostgreSQL 持久化。"""
     from langchain_core.messages import HumanMessage
@@ -168,6 +192,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     console.print(f"[dim]仓库[/] {root}\n[dim]会话[/] {thread_id}\n[dim]任务[/] {args.task}")
 
+    _check_pg(settings.pg_dsn)
     with open_checkpointer(settings.pg_dsn) as checkpointer:
         graph = build_graph(root, settings, checkpointer)
         config = {"configurable": {"thread_id": thread_id}, "recursion_limit": RECURSION_LIMIT}
@@ -234,9 +259,14 @@ def main(argv: list[str] | None = None) -> int:
     if not args.task:
         parser.print_help()
         return 0
-    if args.agent:
-        return cmd_agent(args)
-    return cmd_run(args)
+
+    try:
+        if args.agent:
+            return cmd_agent(args)
+        return cmd_run(args)
+    except RuntimeError as exc:  # 配置缺失 / PG 连不上等，给一句人话而不是堆栈
+        console.print(f"\n[red]错误：[/]{escape(str(exc))}")
+        return 1
 
 
 if __name__ == "__main__":
