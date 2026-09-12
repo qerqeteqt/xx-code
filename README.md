@@ -8,8 +8,9 @@
 
 ## 当前状态
 
-**M2 完成**：骨架、模型自检、文件/搜索工具、三个 worker agent 均可运行，可用 `--agent` 单独驱动任一 worker（真实 ReAct 循环）。
-**尚无多 Agent 编排与命令执行**，见下方路线图。
+**M3 完成**：整条链路已打通 —— 给一句话任务，Supervisor 自动调度 Explorer / Coder / Verifier
+完成「定位 → 修改 → 验证」，高风险命令会暂停等你确认，会话由 PostgreSQL 持久化。
+70 个单测通过。
 
 ## 环境要求
 
@@ -35,9 +36,12 @@ python -m code_agent.cli --check
 # 4. 运行单元测试
 python -m pytest
 
-# 5. 单 agent 模式：只跑一个 worker（M2）
+# 5. 完整模式：Supervisor 调度三个 worker 自动完成任务
+python -m code_agent.cli --repo <目标仓库路径> "运行测试，把失败的修好"
+#    过程会打印调度决策与各 agent 的工具调用；危险命令会暂停等你输入 y/N
+
+# 6. 单 agent 模式：只跑一个 worker
 python -m code_agent.cli --repo . --agent explorer "简要说明这个项目的模块划分"
-python -m code_agent.cli --repo . --agent verifier "核验 tests/test_paths.py 是否覆盖了越界场景"
 #    --agent 可选 explorer / coder / verifier；coder 会真实修改文件，注意目标仓库
 ```
 
@@ -47,21 +51,22 @@ python -m code_agent.cli --repo . --agent verifier "核验 tests/test_paths.py �
 xx-code/
 ├── code_agent/          # 主包
 │   ├── config.py        # 配置加载 + 模型构建
-│   ├── cli.py           # 命令行入口
+│   ├── cli.py           # 命令行入口 + HITL 交互
 │   ├── paths.py         # 目标仓库路径围栏
+│   ├── messages.py      # text_of()：从 thinking 模型的消息里取正文
+│   ├── state.py         # 父图共享 State
 │   ├── tools/           # 工具集
-│   │   ├── _util.py        # safe：工具异常兜底
+│   │   ├── _util.py        # safe：工具异常兜底（放行 interrupt）
 │   │   ├── filesystem.py   # read_file / write_file / edit_file / list_dir
 │   │   ├── search.py       # glob_search / grep_search
-│   │   ├── command.py      # run_command + 危险命令 HITL   (M3)
+│   │   ├── command.py      # run_command + 危险命令 HITL
 │   │   └── web.py          # 联网检索                     (M4)
 │   ├── workers.py       # Explorer / Coder / Verifier 三个 worker 子图
-│   ├── state.py         # 共享 State 定义            (M3)
-│   ├── supervisor.py    # 中心调度                   (M3)
-│   └── graph.py         # 组装 StateGraph            (M3)
+│   ├── supervisor.py    # 中心调度（JSON 路由 + 指令注入）
+│   └── graph.py         # 组装 StateGraph + PostgreSQL checkpointer
 ├── data/                # 样例仓库等数据
 ├── models/              # 本地模型（暂空）
-├── tests/               # 单元测试（39 passed, 1 skipped）
+├── tests/               # 单元测试（70 passed, 1 skipped）
 ├── DEVLOG.md            # 开发日志：每步实际干了什么
 └── requirements.txt
 ```
@@ -73,7 +78,7 @@ xx-code/
 | M0 | 项目骨架 + 模型自检 | ✅ |
 | M1 | 文件/搜索工具 + 单元测试（无需模型） | ✅ |
 | M2 | Explorer / Coder / Verifier 三个 worker | ✅ |
-| M3 | Supervisor 调度 + 危险命令 HITL 确认 | ⏳ |
+| M3 | Supervisor 调度 + 危险命令 HITL 确认 | ✅ |
 | M4 | 联网检索 + 输出美化 + 完整文档 | ⏳ |
 
 ## 设计要点

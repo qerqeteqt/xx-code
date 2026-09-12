@@ -194,15 +194,131 @@ python -m pytest
 
 ---
 
+## M3 — Supervisor 调度 + 危险命令 HITL（2026-09-12）
+
+### 目标
+
+把三个 worker 组装成完整的 Supervisor 图，接上 PostgreSQL 持久化，并实现
+「**仅高风险命令**需人工确认」的 HITL。至此一条命令即可交给它自动完成
+「定位 → 修改 → 验证」。
+
+### 改动
+
+| 文件 | 说明 |
+|---|---|
+| `code_agent/state.py` | `OverallState`（`messages` + `attempts`） |
+| `code_agent/messages.py` | `text_of()`：只取 `text` block，跳过 `thinking` |
+| `code_agent/tools/command.py` | `run_command` + 危险命令规则表 + 工具内 `interrupt()` |
+| `code_agent/supervisor.py` | JSON 路由 + 确定性兜底 + **指令注入** |
+| `code_agent/graph.py` | 父图组装 + `open_checkpointer()`（PostgresSaver） |
+| `code_agent/workers.py` | Verifier 加 `run_command`；**移除 `ToolRetryMiddleware`**；加通用约束 |
+| `code_agent/cli.py` | 完整模式 `cmd_run` + interrupt 交互 + 消息归属去重 |
+| `code_agent/tools/_util.py` | `safe` 放行 `GraphBubbleUp` |
+| `tests/test_command.py` | 危险命令识别（21 个用例，含 dry-run 豁免） |
+
+设计要点：
+- supervisor 用 `Command(goto=..., update=...)` 直接路由（不用 `conditional_edges`）；
+  worker 干完 `add_edge(worker, "supervisor")` 回到调度。
+- **checkpointer 只装在根图**，worker 子图不装。
+- HITL：`run_command` 命中危险规则 → 工具内 `interrupt()` → 穿透子图到根图 → CLI 询问 → `Command(resume=...)`。
+- 只有 Verifier 有 `run_command`（最小权限），所以 HITL 只需挂一处。
+
+### 验证
+
+```bash
+"C:\Users\x_x\.conda\envs\langgraph\python.exe" -m pytest
+# => 70 passed, 1 skipped
+```
+
+**端到端（真实调模型，自动完成修复）**：
+
+```bash
+python -m code_agent.cli --repo D:/tmp_m3_final2 "运行测试，把失败的修好"
+```
+
+```
+[supervisor] 下一步 → verifier（任务需要先执行测试获得失败信息，只有 verifier 能执行命令）
+[verifier] → list_dir / glob_search / read_file ×2 / run_command ×2
+[supervisor] 下一步 → coder（需修改代码，verifier 不能改代码）
+[coder] → read_file / edit_file / read_file ×2          ← 一次到位，无空转
+[supervisor] 下一步 → verifier（coder 已修复，需重新执行 pytest 验证）
+[verifier] → run_command(pytest) / run_command(行为复核)
+[supervisor] 下一步 → finish（1 passed，任务全部完成）
+```
+
+失败测试被修好，流程**自然收敛**（没有撞轮次上限）。
+
+**HITL 在真实 CLI 中触发**（管道喂 `n` 模拟拒绝）：
+
+```
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+需要你确认一条危险命令：
+  命令: git clean -fdn
+  原因: 清理未跟踪文件
+  执行吗？[y/N]
+```
+
+确认命令被拒绝后，`scratch.tmp` 仍在磁盘上 —— **安全兜底有效，命令确实没有执行**。
+
+### 备注与坑
+
+这一节的坑特别密集，且**大部分是"思考模型 + 中文化"带来的**：
+
+1. **`with_structured_output` 在本项目不可用**。`deepseek-flash` 是思考模型，DeepSeek 的
+   Anthropic 兼容端点在思考模式下**拒绝强制 tool_choice**：
+   `400 Thinking mode does not support this tool_choice`。
+   → supervisor 改为「提示只输出 JSON → 正则抠 `{...}` → Pydantic 校验 → 规则兜底」。
+
+2. **不能往共享 `messages` 里写人工构造的 `AIMessage`**。思考模型要求 assistant 消息
+   必须原样回传 `thinking` 块，任何手工构造的 assistant 消息都会报
+   `400 The content[].thinking in the thinking mode must be passed back to the API`。
+   → supervisor 的路由结果只 `print`，不进入 state；需要给成员传话时用 **`HumanMessage`**。
+
+3. **`safe` 装饰器会吞掉 `interrupt()`**。`GraphInterrupt` 继承自 `Exception`，
+   被 `except Exception` 捕获后 HITL 永远不触发。
+   → `safe` 增加 `except GraphBubbleUp: raise` 放行。
+
+4. **`ToolRetryMiddleware` 同样会吞掉 `interrupt()`，且无法配置规避**。
+   它的 `wrap_tool_call` 是 `except Exception`（`tool_retry.py:317`），没有放行
+   LangGraph 控制流异常的机制：`GraphInterrupt` 被当成可重试失败，重试 3 次后转成错误
+   ToolMessage。症状是——命令**没有执行**（安全没破），但用户**收不到确认提示**。
+   → 直接移除该中间件；我们的工具都经 `safe` 兜底、从不抛异常，本就不需要它。
+
+5. **子图返回的状态包含它继承的整段共享历史**，导致 CLI 把上一位 agent 的动作
+   误标成当前节点（如 `[verifier] → edit_file`）。因为 `add_messages` 按消息 id 去重，
+   状态本身**没有重复**（已核对：27 条消息、1 条 HumanMessage）。
+   → CLI 打印时按消息 id 去重；`seen` 集合需**跨 resume 保留**，否则中断恢复后会把
+   中断前的消息重复打印。
+
+6. **`git clean -fdn`（dry-run）被误报为危险命令**。dry-run 不改动任何文件。
+   → 规则表增加"豁免正则"机制，`git clean` 带 `-n` / `--dry-run` 时不要求确认。
+
+7. **worker 会"照抄不动手"**（方案 A 共享历史的固有代价）：再次被调用时看到上一位的
+   结论，于是复述而不行动，空转烧掉轮次预算（实测同一份"不通过"结论被产出 4 次，
+   最终撞上 `MAX_ATTEMPTS`）。
+   → supervisor 路由时**附带一条具体的祈使句指令**（以 `HumanMessage` 注入）。
+   实测同一任务从"4 次空转 + 撞上限"变为"一次到位 + 自然收敛"。
+
+8. `run_command` 会**把当前解释器目录前置到子进程 PATH**，这样 `python`/`pytest`
+   解析到 conda env `langgraph`（否则会落到 PATH 上的 3.10）。命令在 `cmd.exe` 中执行。
+
+9. Windows 上 `subprocess` 的 `start_new_session` 是**无效参数**，超时杀进程必须用
+   `taskkill /F /T /PID` 带走整棵进程树。
+
+---
+
 ## 下一步
 
-**M3 — Supervisor 调度 + 危险命令 HITL**
+**M4 — 联网检索 + 输出美化 + 文档**
 
-- `code_agent/state.py`：`OverallState`（`MessagesState` + `attempts`）
-- `code_agent/tools/command.py`：`run_command`（危险命令匹配 + 工具内 `interrupt()`）
-- `code_agent/supervisor.py`：结构化输出路由（含代理不支持强制 tool_choice 时的降级链）
-- `code_agent/graph.py`：父 `StateGraph` + 子图接线 + `PostgresSaver` + `thread_id`
-- CLI：`--repo` + 任务 → 跑整图；捕获 `__interrupt__` 交互确认
+- `code_agent/tools/web.py`：接入已装好的 `TavilySearch`（给 Explorer），无 key 时自动禁用
+- CLI 输出：用 `rich` 美化 trace（区分角色配色、折叠长输出）
+- 评估：`ContextEditingMiddleware` 的清理阈值是否够用；是否需要 `SummarizationMiddleware`
+
+**已识别的最大改进点（v2 方向）**：把编排从「方案 A：共享 messages」升级为
+「方案 B：各 worker 独立 `findings`/`edits`/`verdict` 通道」——
+上面第 7 条的空转、以及上下文膨胀，根源都在方案 A。升级时注意
+**父子两侧 `state_schema` 必须同时声明通道**，否则会被静默丢弃。
 
 > 设计文档（含完整架构、工具清单、编排方式、压缩策略）保存在
 > `C:\Users\x_x\.claude\plans\crispy-forging-patterson.md`
