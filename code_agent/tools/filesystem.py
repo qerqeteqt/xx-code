@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import threading
+
 from langchain_core.tools import tool
 
 from code_agent.paths import RepoRoot
@@ -17,6 +19,12 @@ from code_agent.tools._util import safe
 # 源头截断阈值：这是最便宜、最有效的上下文压缩手段
 MAX_READ_LINES = 400
 MAX_LIST_ENTRIES = 200
+
+# LangGraph 的 ToolNode 会把同一条 AIMessage 里的多个工具调用**并行执行**（已实测确认：
+# 两个各耗时 0.6s 的调用总耗时 0.61s）。而 edit_file / write_file 是"读-改-写"，
+# 并行时会互相覆盖 —— 实测丢过一次修改（两个 edit_file 同时改同一文件，只生效了一个）。
+# 因此用一把进程内的锁把文件写入串行化。
+_WRITE_LOCK = threading.Lock()
 
 
 def build_filesystem_tools(root: RepoRoot, *, allow_write: bool) -> list:
@@ -118,8 +126,9 @@ def build_filesystem_tools(root: RepoRoot, *, allow_write: bool) -> list:
         if target.exists() and target.is_dir():
             return f"Error: 目标是目录，无法写入: {path}"
 
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        with _WRITE_LOCK:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
         return f"已写入 {root.relative(target)}（{len(content.encode('utf-8'))} 字节）"
 
     @tool
@@ -142,20 +151,22 @@ def build_filesystem_tools(root: RepoRoot, *, allow_write: bool) -> list:
         if not target.is_file():
             return f"Error: 文件不存在: {path}"
 
-        text = target.read_text(encoding="utf-8", errors="replace")
-        count = text.count(old_string)
-        if count == 0:
-            return (
-                "Error: 未找到 old_string，无法替换。"
-                "请先 read_file 确认原文（缩进、空白、换行需完全一致）。"
-            )
-        if count > 1:
-            return (
-                f"Error: old_string 在文件中出现 {count} 次，不唯一。"
-                "请补充更多上下文使其唯一。"
-            )
+        # 读-改-写必须整体加锁：并行的第二个编辑否则会读到旧内容、覆盖掉第一个的结果
+        with _WRITE_LOCK:
+            text = target.read_text(encoding="utf-8", errors="replace")
+            count = text.count(old_string)
+            if count == 0:
+                return (
+                    "Error: 未找到 old_string，无法替换。"
+                    "请先 read_file 确认原文（缩进、空白、换行需完全一致）。"
+                )
+            if count > 1:
+                return (
+                    f"Error: old_string 在文件中出现 {count} 次，不唯一。"
+                    "请补充更多上下文使其唯一。"
+                )
+            target.write_text(text.replace(old_string, new_string, 1), encoding="utf-8")
 
-        target.write_text(text.replace(old_string, new_string, 1), encoding="utf-8")
         return f"已修改 {root.relative(target)}：替换 1 处"
 
     read_only = [list_dir, read_file]

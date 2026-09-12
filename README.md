@@ -107,7 +107,7 @@ xx-code/
 │   └── graph.py         # 组装 StateGraph + PostgreSQL checkpointer
 ├── data/sample_repo/    # 故意有 2 个失败用例的练手靶子（安全试跑用）
 ├── models/              # 本地模型（暂空）
-├── tests/               # 测试（90 passed, 1 skipped；含集成测试）
+├── tests/               # 测试（91 passed, 1 skipped；含集成测试与并发回归）
 ├── DEVLOG.md            # 开发日志：每步实际干了什么
 └── requirements.txt
 ```

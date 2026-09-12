@@ -455,6 +455,62 @@ verifier  → run_command(pytest) / run_command(边界抽查) / read_file ×2
 
 ---
 
+## 修复 — 并行工具调用导致编辑丢失（2026-09-12）
+
+### 现象
+
+用户**第一次真实运行**（`--repo data/sample_repo "运行测试，把失败的修好"`）的日志里有可疑痕迹：
+coder 先后发起三个 `edit_file`，其中**第三个的 `old_string` 与第一个完全相同**，却也返回了"已修改"。
+
+### 定位
+
+从持久化状态里按 `tool_call_id` 严格配对后确认：msg#21 的**一条 `AIMessage` 携带了两个
+`edit_file` 调用**（改 add、改 div），两个都报成功；而第三个编辑能成功，说明**第一次的改动已被回退**。
+
+实测确认根因（`tests/test_tool_concurrency.py` 的思路验证）：
+
+```
+X start +0.00 / Y start +0.00 / X end +0.60 / Y end +0.60   总耗时 0.61s（而非 1.2s）
+```
+
+→ **LangGraph 的 ToolNode 会并行执行同一条 AIMessage 里的多个工具调用**。
+而 `edit_file` / `write_file` 是"读-改-写"，两个并行就互相覆盖 —— **丢失更新**。
+
+### 复现
+
+`tests/test_tool_concurrency.py`：人为放大"读"与"写"之间的窗口后**确定性复现**：
+
+```
+修复前：文件最终为 'A = 1\nB = 200\n'  ← 第一处修改整块丢失
+```
+
+### 修复
+
+`code_agent/tools/filesystem.py` 增加进程内 `_WRITE_LOCK`，
+把 `edit_file` / `write_file` 的读-改-写整体串行化。
+
+### 验证
+
+```bash
+"C:\Users\x_x\.conda\envs\langgraph\python.exe" -m pytest tests/test_tool_concurrency.py
+# 修复前：FAILED（A = 100 丢失）；修复后：PASSED
+"C:\Users\x_x\.conda\envs\langgraph\python.exe" -m pytest
+# => 91 passed, 1 skipped
+```
+
+### 备注与坑
+
+1. **这个 bug 是靠"用户第一次真实运行"的日志才发现的** —— 此前的单测与两次演示都没撞上，
+   因为文件读写太快、竞态窗口极小；用假模型做并发测试时也一次就"通过"了（纯属侥幸）。
+   → 说明**让真实使用者尽早跑起来**不可替代。
+2. 影响面：不修的话，agent 的并行编辑会**静默丢改动**，表现为"改了好几处却只生效一处"，
+   模型被迫重做（白花调用）；严重时文件只被改了一半。
+3. 排查手法值得留存：日志里"**两个内容相同的编辑都成功了**"就是丢失更新的典型指纹。
+4. `_WRITE_LOCK` 只保护**本进程内**的并发 —— 对当前"单进程 CLI"够用；
+   若将来有多个进程同时改同一仓库，需要换成文件锁。
+
+---
+
 ## v1 收尾状态（M0–M4 全部完成）
 
 计划中的 5 个里程碑已全部落地，`xx-code` 现在能：
