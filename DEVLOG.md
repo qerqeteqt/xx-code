@@ -440,6 +440,12 @@ verifier  → run_command(pytest) / run_command(边界抽查) / read_file ×2
    不再依赖手工验证 —— 这是安全属性的回归保护。
 3. `data/sample_repo` 不在 `pytest.ini` 的 `testpaths = tests` 收集范围内，
    它的失败用例不会污染项目自身测试（已实测确认）。
+4. **`sample_repo` 嵌在项目里会继承项目根的 `pytest.ini`**：首次真实演示时，
+   在 `sample_repo` 里跑 `python -m pytest` 的 `rootdir` 变成了项目根
+   （`configfile: pytest.ini`、`testpaths=tests`），收集范围错乱，
+   Verifier 多花了约 8 次工具调用去排查"测试到底在哪"。
+   → 给 `sample_repo` 加了它自己的 `pytest.ini`，使其成为**自包含**的仓库。
+   （对真实仓库同理：把 `--repo` 指向大项目的子目录时，可能遇到同类的配置继承问题。）
 
 ---
 
