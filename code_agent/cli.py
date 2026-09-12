@@ -1,7 +1,9 @@
 """命令行入口。
 
-M0 阶段只实现 `--check`：验证模型连通性与 tool calling 是否可用。
-后续里程碑会补上 --repo 目标仓库、任务执行、HITL 交互等。
+用法：
+    python -m code_agent.cli --check
+    python -m code_agent.cli --repo <路径> --agent explorer "任务"
+    python -m code_agent.cli --repo <路径> "任务"          # supervisor 模式（M3）
 """
 
 from __future__ import annotations
@@ -9,6 +11,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import uuid
+
+AGENT_ROLES = ("explorer", "coder", "verifier")
 
 
 def _fix_console_encoding() -> None:
@@ -18,6 +23,23 @@ def _fix_console_encoding() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
         except Exception:
             pass
+
+
+def _text_of(message) -> str:
+    """取出消息中的文本。
+
+    本模型的 content 不是字符串，而是 block 列表（含 thinking 块），
+    所以必须筛出 type == "text" 的块，不能直接当字符串用。
+    """
+    content = getattr(message, "content", message)
+    if isinstance(content, str):
+        return content
+    parts = [
+        block.get("text", "")
+        for block in (content or [])
+        if isinstance(block, dict) and block.get("type") == "text"
+    ]
+    return "".join(parts)
 
 
 def cmd_check(_args: argparse.Namespace) -> int:
@@ -30,8 +52,7 @@ def cmd_check(_args: argparse.Namespace) -> int:
     llm = build_llm(settings)
 
     reply = llm.invoke("你是连通性测试。请只回复两个字：正常")
-    text = reply.content if isinstance(reply.content, str) else str(reply.content)
-    print(f"[2/3] 文本调用成功  -> {text.strip()!r}")
+    print(f"[2/3] 文本调用成功  -> {_text_of(reply).strip()!r}")
 
     from langchain_core.tools import tool
 
@@ -46,7 +67,6 @@ def cmd_check(_args: argparse.Namespace) -> int:
     tool_calls = getattr(reply2, "tool_calls", None) or []
     if not tool_calls:
         print("[3/3] 失败：模型没有返回工具调用，该端点可能不支持 tool calling")
-        print(f"       原始回复：{str(reply2.content)[:200]}")
         return 2
 
     print(f"[3/3] tool calling 正常  -> {json.dumps(tool_calls, ensure_ascii=False)}")
@@ -54,55 +74,33 @@ def cmd_check(_args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_demo_tools(_args: argparse.Namespace) -> int:
-    """在临时目录里演示 M1 的文件与搜索工具（不触碰任何真实文件）。"""
-    import tempfile
+def cmd_agent(args: argparse.Namespace) -> int:
+    """单 agent 模式：只运行指定的 worker。"""
+    from langchain_core.messages import HumanMessage
 
+    from code_agent.config import Settings
     from code_agent.paths import RepoRoot
-    from code_agent.tools.filesystem import build_filesystem_tools
-    from code_agent.tools.search import build_search_tools
+    from code_agent.workers import build_worker
 
-    print("=" * 62)
-    print("M1 工具演示 —— 全程在临时目录，不会修改任何真实文件")
-    print("=" * 62)
+    root = RepoRoot(args.repo)
+    worker = build_worker(args.agent, root, Settings.from_env())
 
-    with tempfile.TemporaryDirectory(prefix="code_agent_demo_") as tmp:
-        root = RepoRoot(tmp)
-        fs = {t.name: t for t in build_filesystem_tools(root, allow_write=True)}
-        search = {t.name: t for t in build_search_tools(root)}
+    print(f"[{args.agent}] 仓库: {root}")
+    print(f"[{args.agent}] 任务: {args.task}\n")
 
-        def step(title: str, tool_name: str, **kwargs) -> None:
-            print(f"\n### {title}")
-            print(f"$ {tool_name}({kwargs})")
-            tool = fs.get(tool_name) or search[tool_name]
-            print(tool.invoke(kwargs))
+    final = None
+    config = {"configurable": {"thread_id": uuid.uuid4().hex}}
+    payload = {"messages": [HumanMessage(args.task)]}
+    for chunk in worker.stream(payload, config, stream_mode="updates"):
+        for update in chunk.values():
+            for message in (update or {}).get("messages", []) or []:
+                final = message
+                for call in getattr(message, "tool_calls", None) or []:
+                    raw = json.dumps(call.get("args", {}), ensure_ascii=False)
+                    print(f"  → {call.get('name')}({raw[:160]})")
 
-        step(
-            "写入一个新文件（含中文注释，故意埋一个 bug）",
-            "write_file",
-            path="src/calc.py",
-            content="def add(a, b):\n    # 中文注释：加法\n    return a - b  # 故意的 bug\n",
-        )
-        step("读取文件（带行号）", "read_file", path="src/calc.py")
-        step(
-            "精确替换，修掉 bug",
-            "edit_file",
-            path="src/calc.py",
-            old_string="return a - b",
-            new_string="return a + b",
-        )
-        step("再读一次确认", "read_file", path="src/calc.py")
-        step("列目录", "list_dir", path=".")
-        step("glob 查找 py 文件", "glob_search", pattern="**/*.py")
-        step(
-            "grep 搜中文（内置中间件在这里会失效）",
-            "grep_search",
-            pattern="中文注释",
-        )
-        step("grep 按内容定位函数", "grep_search", pattern="def add")
-        step("越界访问被拦截", "read_file", path="../../etc/passwd")
-
-    print("\n演示结束：以上文件都在临时目录，已随临时目录一起删除。")
+    print("-" * 60)
+    print(_text_of(final) if final is not None else "(无输出)")
     return 0
 
 
@@ -111,14 +109,15 @@ def build_parser() -> argparse.ArgumentParser:
         prog="code_agent",
         description="基于 LangGraph 的多 Agent 编码助手",
     )
-    parser.add_argument("--repo", metavar="PATH", help="目标仓库路径（M3 起使用）")
+    parser.add_argument("task", nargs="?", help="任务描述（自然语言）")
     parser.add_argument(
-        "--check", action="store_true", help="自检：验证模型连通与 tool calling"
+        "--repo", metavar="PATH", default=".", help="目标仓库路径（默认当前目录）"
     )
     parser.add_argument(
-        "--demo-tools",
-        action="store_true",
-        help="演示 M1 的文件与搜索工具（临时目录，安全）",
+        "--agent", choices=AGENT_ROLES, help="单 agent 模式：只运行指定 worker"
+    )
+    parser.add_argument(
+        "--check", action="store_true", help="自检：验证模型连通与 tool calling"
     )
     return parser
 
@@ -130,11 +129,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check:
         return cmd_check(args)
-    if args.demo_tools:
-        return cmd_demo_tools(args)
 
-    parser.print_help()
-    return 0
+    if not args.task:
+        parser.print_help()
+        return 0
+
+    if not args.agent:
+        print("supervisor 模式将在 M3 提供；当前请用 --agent {explorer,coder,verifier}。")
+        return 1
+
+    return cmd_agent(args)
 
 
 if __name__ == "__main__":

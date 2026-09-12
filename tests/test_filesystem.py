@@ -99,11 +99,9 @@ def test_escape_is_blocked(tools):
     assert out.startswith("Error")
 
 
-def test_read_file_accepts_search_style_virtual_path(tools):
-    """glob_search 返回形如 "/src/main.py" 的虚拟路径，read_file 必须能直接使用。"""
-    out = tools["read_file"].invoke({"path": "/src/main.py"})
-    assert not out.startswith("Error")
-    assert "line1" in out
+def test_leading_slash_path_is_rejected(tools):
+    """以 / 开头的路径按绝对路径处理，会被围栏拦下（搜索工具返回的是相对路径）。"""
+    assert tools["read_file"].invoke({"path": "/src/main.py"}).startswith("Error")
 
 
 def test_write_escape_is_blocked(tools):

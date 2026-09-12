@@ -126,8 +126,8 @@ cd D:\pycharm\Mutil-Agent
    并顺带解决下面第 2 条、加上截断与忽略目录。
 2. 内置中间件返回的是 `"/code_agent\cli.py"` 这种**带前导斜杠、夹杂反斜杠的虚拟路径**，
    直接回传给 `read_file` 会被当成绝对路径 → 判定越界。
-   → `RepoRoot.resolve()` 现在把**无盘符的前导斜杠**按"仓库根相对"解释；自研搜索直接返回干净
-   的 POSIX 相对路径，两边都对齐了。
+   → 自研搜索工具直接返回干净的 POSIX 相对路径，问题从源头消除。
+   （M1 当时还额外让 `resolve()` 兼容"无盘符前导斜杠"；**M2 发现那是死代码且有跨平台语义问题，已移除**，见 M2 节坑 1。）
 3. `safe` 装饰器是硬性要求：`create_agent` 默认只吞参数校验错误，工具体里的其他异常会
    **冒泡崩掉整个 run**。所以每个工具都必须保证不抛异常。
 4. `RepoRoot` 的安全性依赖 `Path.resolve()` 会展开 `..` 并跟随符号链接，因此指向仓库外的
@@ -135,16 +135,74 @@ cd D:\pycharm\Mutil-Agent
 
 ---
 
+## M2 — 三个 worker 子图（2026-09-12）
+
+### 目标
+
+用 `create_agent` 构建 Explorer / Coder / Verifier 三个 worker 子图，让**单个 worker 能独立跑通完整 ReAct 循环**（真实调模型，不是 mock）。
+
+### 改动
+
+| 文件 | 说明 |
+|---|---|
+| `code_agent/workers.py` | 三个 worker：独立 system_prompt + 裁剪工具集 + 共用中间件 |
+| `code_agent/cli.py` | 重写：删除 `--demo-tools`（测试脚手架）；新增 `--agent` 单 agent 模式 + `task` 位置参数；新增 `_text_of()` |
+| `code_agent/paths.py` | **移除**"虚拟路径"处理（死代码，见坑 1） |
+| `tests/test_paths.py` | 删虚拟路径用例；改为断言前导 `/` 被拒；**新增符号链接越界用例** |
+| `tests/test_filesystem.py` | 同步替换为"前导 `/` 被拒" |
+
+设计要点：
+
+- **最小权限**：Explorer 只读；Coder 只读 + `write_file`/`edit_file`；Verifier 只读（M3 加 `run_command`）。
+- 三个 worker 共用中间件：`ContextEditingMiddleware`（清旧工具结果）+ `ToolRetryMiddleware(on_failure="continue")` + `ToolCallLimitMiddleware(run_limit=25)` + `ModelCallLimitMiddleware(run_limit=12)`。
+- **worker 子图不装 checkpointer**，持久化统一留给根图（M3）。
+- 每个 worker 是 `create_agent(...)` 编译出的独立子图，可直接 `stream()` 运行。
+- **主动跳过计划里的 `state.py`**：单 worker 用不到，等 M3 组图时再加，不留无人使用的代码。
+
+### 验证
+
+真实调用模型跑三个角色：
+
+```
+# Explorer
+python -m code_agent.cli --repo . --agent explorer "简要说明这个项目的模块划分..."
+  → 16 次工具调用（list_dir / read_file 逐步深入），产出准确的模块职责报告
+
+# Coder（在临时仓库验证写权限）
+  → list_dir → glob_search → read_file → edit_file → read_file 复验
+  → 文件确实被修好：`return a - b` → `return a + b`
+  → 且正确选择了 edit_file 而非 write_file
+
+# Verifier
+  → 12 次工具调用做静态审查，给出结论并附理由
+
+python -m pytest
+  → 39 passed, 1 skipped
+```
+
+### 备注与坑
+
+1. **Verifier 发现了设计问题（这正是多 Agent 的价值）**。M1 为兼容内置中间件加了
+   "无盘符前导斜杠按仓库根相对解释"，它指出：
+   (a) 该逻辑使 `test_escape_via_absolute_outside` 变成 Windows 专用，在 POSIX 上会失败；
+   (b) POSIX 下 `read_file("/etc/passwd")` 会被静默解释成 `<repo>/etc/passwd`（无安全漏洞，但语义错误）。
+   核查后确认：M1 已弃用内置中间件、自研搜索返回纯相对路径 → **这段兼容逻辑是死代码**。
+   → 直接移除：代码更简单，两个问题一并消失。
+2. `thinking` block 已处理：`cli.py` 的 `_text_of()` 只取 `type == "text"` 的块，跳过 thinking。
+3. 符号链接越界用例在本机被 `skip`（Windows 创建符号链接需权限），逻辑仍由 `Path.resolve()` 保证。
+4. 单 agent 模式用 `stream_mode="updates"` 实时打印工具调用轨迹，足以看清 ReAct 循环。
+
+---
+
 ## 下一步
 
-**M2 — 三个 worker 子图**
+**M3 — Supervisor 调度 + 危险命令 HITL**
 
 - `code_agent/state.py`：`OverallState`（`MessagesState` + `attempts`）
-- `code_agent/workers.py`：用 `create_agent` 构建 Explorer / Coder / Verifier
-  - 各自独立 `system_prompt` + **裁剪过的工具集**（注意参数是 `system_prompt=`，不是 `prompt=`）
-  - **子图不装 checkpointer**（只有根图装）
-- 中间件：`ContextEditingMiddleware`（清旧工具结果）、`ToolRetryMiddleware(on_failure="continue")`、`ToolCallLimitMiddleware`
-- 验证：单个 worker 能独立跑通一轮"读文件 → 回答"的工具调用
+- `code_agent/tools/command.py`：`run_command`（危险命令匹配 + 工具内 `interrupt()`）
+- `code_agent/supervisor.py`：结构化输出路由（含代理不支持强制 tool_choice 时的降级链）
+- `code_agent/graph.py`：父 `StateGraph` + 子图接线 + `PostgresSaver` + `thread_id`
+- CLI：`--repo` + 任务 → 跑整图；捕获 `__interrupt__` 交互确认
 
 > 设计文档（含完整架构、工具清单、编排方式、压缩策略）保存在
 > `C:\Users\x_x\.claude\plans\crispy-forging-patterson.md`

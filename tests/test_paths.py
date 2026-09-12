@@ -57,11 +57,20 @@ def test_relative_posix(repo, tmp_path):
     assert repo.relative(tmp_path / "src" / "main.py") == "src/main.py"
 
 
-def test_resolve_virtual_path_from_search_middleware(repo, tmp_path):
-    """/src/main.py 是搜索中间件返回的虚拟路径，应被当作仓库内路径。"""
-    assert repo.resolve("/src/main.py") == (tmp_path / "src" / "main.py").resolve()
-
-
-def test_virtual_path_cannot_escape(repo):
+def test_leading_slash_is_treated_as_absolute_and_rejected(repo):
+    """以 / 开头的路径按绝对路径处理（仓库内搜索工具返回的是相对路径）。"""
     with pytest.raises(PathEscapeError):
-        repo.resolve("/../outside.txt")
+        repo.resolve("/src/main.py")
+
+
+def test_symlink_pointing_outside_is_rejected(repo, tmp_path):
+    """指向仓库外的符号链接必须被拒绝（创建符号链接在 Windows 上可能需要权限）。"""
+    outside = tmp_path.parent / "outside_target.txt"
+    outside.write_text("secret\n", encoding="utf-8")
+    link = tmp_path / "link.txt"
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("当前环境无法创建符号链接")
+    with pytest.raises(PathEscapeError):
+        repo.resolve("link.txt")

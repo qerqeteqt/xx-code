@@ -29,23 +29,12 @@ class RepoRoot:
     def resolve(self, relative: str | Path) -> Path:
         """把仓库内路径解析为绝对路径；越界则抛 `PathEscapeError`。
 
-        接受三种写法：
-        1. 相对仓库根的路径，如 `"src/main.py"`
-        2. 仓库内的绝对路径，如 `D:/repo/src/main.py`（带盘符）
-        3. **虚拟路径**，如 `"/src/main.py"` —— 这是
-           `FilesystemFileSearchMiddleware` 的输出格式（它用 `/` 代表仓库根）。
-           无盘符的前导斜杠一律按"仓库根相对"解释，否则搜索结果没法直接回传给
-           `read_file`。
+        接受相对仓库根的路径（如 `"src/main.py"`）或仓库内的绝对路径。
+        以 `/` 开头的路径按**绝对路径**处理，因此通常会被判定越界 ——
+        本项目的搜索工具返回的是相对路径，不需要虚拟路径约定。
         """
-        raw = str(relative)
-        candidate_path = Path(raw)
-        if candidate_path.is_absolute() and candidate_path.drive:
-            # 真·绝对路径（带盘符），直接校验
-            candidate = candidate_path
-        else:
-            # 相对路径，或无盘符的 "/xxx" 虚拟路径
-            candidate = self.root / raw.lstrip("/\\")
-
+        raw = Path(str(relative))
+        candidate = raw if raw.is_absolute() else self.root / raw
         resolved = candidate.resolve()
         if not resolved.is_relative_to(self.root):
             raise PathEscapeError(

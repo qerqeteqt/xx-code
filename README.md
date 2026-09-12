@@ -8,8 +8,8 @@
 
 ## 当前状态
 
-**M1 完成**：项目骨架、模型自检、文件/搜索工具均已就绪（40 个单测通过）。
-**尚无 Agent 编排**，见下方路线图。
+**M2 完成**：骨架、模型自检、文件/搜索工具、三个 worker agent 均可运行，可用 `--agent` 单独驱动任一 worker（真实 ReAct 循环）。
+**尚无多 Agent 编排与命令执行**，见下方路线图。
 
 ## 环境要求
 
@@ -35,9 +35,10 @@ python -m code_agent.cli --check
 # 4. 运行单元测试
 python -m pytest
 
-# 5. （可选）看工具实际效果：写入 → 读取 → 替换 → 搜索 → 越界拦截
-#    全程在临时目录，不会修改任何真实文件
-python -m code_agent.cli --demo-tools
+# 5. 单 agent 模式：只跑一个 worker（M2）
+python -m code_agent.cli --repo . --agent explorer "简要说明这个项目的模块划分"
+python -m code_agent.cli --repo . --agent verifier "核验 tests/test_paths.py 是否覆盖了越界场景"
+#    --agent 可选 explorer / coder / verifier；coder 会真实修改文件，注意目标仓库
 ```
 
 ## 目录结构
@@ -54,13 +55,13 @@ xx-code/
 │   │   ├── search.py       # glob_search / grep_search
 │   │   ├── command.py      # run_command + 危险命令 HITL   (M3)
 │   │   └── web.py          # 联网检索                     (M4)
-│   ├── state.py         # 共享 State 定义            (M2)
-│   ├── workers.py       # Explorer / Coder / Verifier (M2)
+│   ├── workers.py       # Explorer / Coder / Verifier 三个 worker 子图
+│   ├── state.py         # 共享 State 定义            (M3)
 │   ├── supervisor.py    # 中心调度                   (M3)
 │   └── graph.py         # 组装 StateGraph            (M3)
 ├── data/                # 样例仓库等数据
 ├── models/              # 本地模型（暂空）
-├── tests/               # 单元测试（40 passed）
+├── tests/               # 单元测试（39 passed, 1 skipped）
 ├── DEVLOG.md            # 开发日志：每步实际干了什么
 └── requirements.txt
 ```
@@ -71,7 +72,7 @@ xx-code/
 |---|---|---|
 | M0 | 项目骨架 + 模型自检 | ✅ |
 | M1 | 文件/搜索工具 + 单元测试（无需模型） | ✅ |
-| M2 | Explorer / Coder / Verifier 三个 worker | ⏳ |
+| M2 | Explorer / Coder / Verifier 三个 worker | ✅ |
 | M3 | Supervisor 调度 + 危险命令 HITL 确认 | ⏳ |
 | M4 | 联网检索 + 输出美化 + 完整文档 | ⏳ |
 
