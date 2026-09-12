@@ -1,0 +1,23 @@
+# 直接依赖，版本锁定为 conda env `langgraph` 中的实际安装版本
+# 环境：Python 3.13
+
+# ---- 编排 ----
+langgraph==1.1.2
+
+# ---- Agent / 模型 / 工具 ----
+langchain==1.2.12
+langchain-core==1.2.18
+langchain-anthropic==1.3.4
+
+# ---- 持久化（PostgreSQL checkpointer）----
+langgraph-checkpoint-postgres==3.0.5
+psycopg==3.3.3
+psycopg-pool==3.3.0
+
+# ---- 配置 / 输出 ----
+python-dotenv==1.2.1
+pydantic==2.12.5
+rich==14.3.3
+
+# ---- 可选：联网检索（需要 TAVILY_API_KEY）----
+# langchain-tavily==0.2.17
