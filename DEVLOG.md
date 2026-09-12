@@ -404,6 +404,45 @@ verifier  → run_command(pytest) / run_command(边界抽查) / read_file ×2
 
 ---
 
+## 补测 — 集成测试安全网（2026-09-12）
+
+### 目标
+
+在动「方案 B」重构之前，先给最容易改坏的部分（supervisor 路由、图接线、HITL 暂停/恢复）
+上自动化保护。在此之前这 75 个单测**全是纯函数**，核心调度只有手工验证记录。
+
+### 改动
+
+| 文件 | 说明 |
+|---|---|
+| `tests/conftest.py` | `ScriptedModel`（脚本化模型，不联网）+ `fake_settings` 夹具 |
+| `tests/test_supervisor.py` | 9 个用例：JSON 路由 / `finish`→`END` / 坏 JSON 兜底 / 模型抛异常兜底 / 轮次上限 / 指令注入 |
+| `tests/test_hitl.py` | 4 个用例：危险命令暂停（含原因）/ 拒绝后文件不动 / 批准后真执行 / 安全命令不暂停 |
+| `tests/test_graph.py` | 2 个用例：图接线（节点与边）、子图消息不重复累加 |
+| `data/sample_repo/` | 故意含 2 个失败用例的**练手靶子** |
+
+**使能技巧**：`FakeMessagesListChatModel` 没实现 `bind_tools`（抛 `NotImplementedError`），
+子类化成 `ScriptedModel` 把 `bind_tools` 变成 no-op，就能驱动完整的 `create_agent`
+与整张图 —— **不联网、秒级、不花钱**。
+
+### 验证
+
+```bash
+"C:\Users\x_x\.conda\envs\langgraph\python.exe" -m pytest
+# => 90 passed, 1 skipped（新增 15 个）
+```
+
+### 备注与坑
+
+1. 集成测试最大的价值是**把"静默失败"变成"断言失败"**：方案 B 的通道声明若漏了一边，
+   字段会被静默丢弃、程序照常跑不报错；有测试后 1 秒就暴露。
+2. HITL 的「拒绝后文件仍在 / 批准后文件真没了」现在是**自动化断言**，
+   不再依赖手工验证 —— 这是安全属性的回归保护。
+3. `data/sample_repo` 不在 `pytest.ini` 的 `testpaths = tests` 收集范围内，
+   它的失败用例不会污染项目自身测试（已实测确认）。
+
+---
+
 ## v1 收尾状态（M0–M4 全部完成）
 
 计划中的 5 个里程碑已全部落地，`xx-code` 现在能：
@@ -421,9 +460,9 @@ python -m code_agent.cli --repo <仓库> "运行测试，把失败的修好"
    缓解，但没根治），上下文也会随任务变大而膨胀。→ 升级到方案 B（各 worker 独立
    `findings`/`edits`/`verdict` 通道）是**下一步最大的收益点**。
    升级时务必注意：**父子两侧 `state_schema` 必须同时声明通道**，否则静默丢弃。
-2. **图与调度的逻辑没有自动化测试**。目前 75 个单测覆盖的是纯函数（路径围栏 / 文件工具 /
-   搜索 / 危险命令识别 / web 开关）；supervisor 路由、子图接线、HITL 暂停-恢复
-   都只有手工验证记录。→ 需要引入 fake LLM 或录制回放来做集成测试。
+2. ~~图与调度的逻辑没有自动化测试~~ → **已补**（见上节「补测」）：supervisor 路由、
+   图接线、HITL 暂停-恢复现在都有断言覆盖，总计 90 个测试。剩余未覆盖的是
+   `run_command` 的超时/进程树清理、以及真实模型的端到端行为（后者靠手工验证）。
 3. **`attempts` 上限（8）与 `recursion_limit`（250）是硬编码**，没有按任务规模自适应。
 4. ~~PG 连接失败没有友好报错~~ → **已修**：CLI 加了 `_check_pg()` 预检，`main()` 统一捕获
    `RuntimeError` 并打印人话提示（同时覆盖"缺少 `AGENT_PG_DSN`"）。原先会甩出一长串 psycopg

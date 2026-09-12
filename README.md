@@ -10,9 +10,10 @@
 
 **M0–M4 全部完成**（v1）：给一句话任务，Supervisor 自动调度 Explorer / Coder / Verifier
 完成「定位 → 修改 → 验证」，高风险命令会暂停等你确认，会话由 PostgreSQL 持久化，
-支持联网检索。75 个单测通过。
+支持联网检索。90 个测试通过（含 supervisor 路由 / 图接线 / HITL 的集成测试）。
 
-> 已知未完成项与后续方向（编排升级、集成测试等）见 [DEVLOG.md](DEVLOG.md) 末尾的「v1 收尾状态」。
+> 第一次使用建议先拿 `data/sample_repo`（故意有 2 个失败用例）练手。
+> 已知未完成项与后续方向（编排升级等）见 [DEVLOG.md](DEVLOG.md) 末尾的「v1 收尾状态」。
 
 ## 环境要求
 
@@ -66,9 +67,9 @@ xx-code/
 │   ├── workers.py       # Explorer / Coder / Verifier 三个 worker 子图
 │   ├── supervisor.py    # 中心调度（JSON 路由 + 指令注入）
 │   └── graph.py         # 组装 StateGraph + PostgreSQL checkpointer
-├── data/                # 样例仓库等数据
+├── data/sample_repo/    # 故意有 2 个失败用例的练手靶子（安全试跑用）
 ├── models/              # 本地模型（暂空）
-├── tests/               # 单元测试（75 passed, 1 skipped）
+├── tests/               # 测试（90 passed, 1 skipped；含集成测试）
 ├── DEVLOG.md            # 开发日志：每步实际干了什么
 └── requirements.txt
 ```
