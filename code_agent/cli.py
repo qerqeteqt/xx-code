@@ -323,14 +323,9 @@ def cmd_chat(args: argparse.Namespace) -> int:
     from code_agent.paths import RepoRoot
 
     settings = Settings.from_env()
-
-    repo_arg = args.repo
-    if repo_arg is None:
-        try:
-            repo_arg = _clean(input("仓库路径 [.] : ")).strip() or "."
-        except EOFError:
-            repo_arg = "."
-    root = RepoRoot(repo_arg)
+    # 不指定 --repo 就用**当前目录** —— 像 Claude Code 那样：cd 到项目里直接开聊，
+    # 不再多问一句。启动时会把实际使用的目录打出来，免得搞错。
+    root = RepoRoot(args.repo or ".")
 
     if args.thread_id:
         thread_id, label = args.thread_id, "[dim]（指定会话）[/]"
@@ -387,8 +382,13 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 console.print(Panel(final, title="最终结论", border_style="green"))
 
     console.print("\n[dim]会话已保存（内容在 PostgreSQL 里，退出不会丢）。下次继续：[/]")
-    console.print(f"  [cyan]python -m code_agent.cli --chat --repo {root}[/]")
-    console.print(f"  [dim]或指定会话：[/][cyan]--thread-id {thread_id}[/]")
+    if Path.cwd() == Path(root.root):
+        console.print("  [cyan]xx-code[/]  [dim]（当前目录就是该仓库，会自动续接本次会话）[/]")
+    else:
+        console.print(f"  [cyan]cd {root}[/]  然后 [cyan]xx-code[/]")
+    console.print(
+        f"  [dim]想直接指定会话：[/][cyan]xx-code --repo {root} --thread-id {thread_id}[/]"
+    )
     return 0
 
 
@@ -426,12 +426,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.chat:
             return cmd_chat(args)
-        if not args.task:
-            parser.print_help()
-            return 0
         if args.agent:
+            if not args.task:
+                console.print("[red]--agent 需要同时给出任务[/]")
+                return 1
             return cmd_agent(args)
-        return cmd_run(args)
+        if args.task:
+            return cmd_run(args)
+        # 不带任何参数 → 直接进入对话（这是最常用的用法）
+        return cmd_chat(args)
     except RuntimeError as exc:  # 配置缺失 / PG 连不上等，给一句人话而不是堆栈
         console.print(f"\n[red]错误：[/]{escape(str(exc))}")
         return 1

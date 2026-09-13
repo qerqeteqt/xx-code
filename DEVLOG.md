@@ -700,6 +700,51 @@ CLI 之前是"节点级 trace + 最后整块面板"，回答一次性蹦出来�
 
 ---
 
+## 新增 — 短命令入口与"当前目录即仓库"（2026-09-13）
+
+### 目标
+
+用户问："我只能用 `python -m code_agent.cli --chat --repo D:\...\sample_repo` 吗？也太长了，
+而且这个目录是什么鬼？能不能像 Claude 那样一句话就开始对话？"
+
+两个问题都是我此前的疏忽：**入口命令没装**、**仓库路径要手写**。
+
+### 改动
+
+1. **装上 `xx-code` 入口**（`pyproject.toml` 里早就写好，但一直没执行 `pip install -e .`）。
+2. **`--chat` 不再追问仓库路径** —— 不传 `--repo` 就用**当前目录**（去掉了我原先加的那个
+   "仓库路径 [.] :" 提示）。启动时会打印实际使用的目录，避免搞错。
+3. **不带任何参数直接进对话**：`xx-code` 即开始聊天（原先无任务时是打印帮助）。
+4. 退出提示改为短命令形式：
+   ```
+   会话已保存。下次继续：
+     xx-code  （当前目录就是该仓库，会自动续接本次会话）
+   ```
+
+### 验证
+
+```powershell
+cd D:\pycharm\Mutil-Agent\data\sample_repo
+xx-code
+# => 仓库 D:\pycharm\Mutil-Agent\data\sample_repo
+#    会话 80243508…（已续接上次会话）
+#    >>>   （直接开始对话）
+```
+
+`pytest` → 105 passed, 1 skipped。
+
+### 备注与坑
+
+- `pip install -e .` 的依赖字段刻意为空，**不会改动环境里已有的包**；
+  卸载用 `pip uninstall xx-code`。
+- pip 会警告 "script xx-code.exe is installed in ... which is not on PATH" ——
+  这是因为我从 bash（未激活环境）执行安装；**在 PowerShell 里 `conda activate langgraph`
+  之后该目录就在 PATH 上**，`xx-code` 可直接使用。
+- 顺带明确一条安全语义：**当前目录即仓库**意味着在错误的目录下启动，agent 就会操作那个目录。
+  启动时打印仓库路径就是为了让这件事可见。
+
+---
+
 ## v1 收尾状态（M0–M4 全部完成）
 
 计划中的 5 个里程碑已全部落地，`xx-code` 现在能：
