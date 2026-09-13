@@ -654,6 +654,52 @@ CLI 取"最后一条 AI 消息"时拿到的仍是上一轮的旧回答 → 表�
 
 ---
 
+## 新增 — 回答流式输出（2026-09-13）
+
+### 目标
+
+CLI 之前是"节点级 trace + 最后整块面板"，回答一次性蹦出来，没有对话感。改成流式。
+
+### 为什么不能直接用 `stream_mode="messages"`
+
+因为**最终回答是 supervisor 在节点内部用 `llm.invoke()` 生成的** ——
+节点内部的模型调用**不会**出现在 `stream_mode="messages"` 里。所以：
+
+1. supervisor 改用 `llm.stream()`，把**正文增量**通过 `get_stream_writer()` 推成 custom 块；
+2. CLI 用 `stream_mode=["updates", "custom"]`：
+   - `updates` → 工具轨迹，**interrupt 只在这个模式里出现**（两者必须并用）
+   - `custom` → 回答增量，逐字打印
+3. 只推**正文**增量，跳过 thinking 块（否则满屏内心活动）。
+
+### 顺带修掉一个潜伏 bug
+
+**流式累加出来的 content 形态和 `invoke` 不一样**：
+
+```python
+# invoke 出来（规整 block 列表）
+[{'type': 'thinking', ...}, {'type': 'text', 'text': 'Python 是一种…'}]
+# 流式累加出来（str/dict 混合！）
+['', {'type': 'thinking', ...}, 'Python 是一种…']
+```
+
+`text_of()` 原本只认 dict 块 → 会把**流式消息读成空字符串**。
+→ 已修：两种形态都认；另加 `normalize_content()`，存回 state 前把裸字符串
+规范成 `{"type": "text", ...}` 块，避免下一轮发回 API 时报错。
+
+### 验证
+
+- **thinking 块的 signature 在流式累加后保留**（实测 `b4f948f1-…`），所以回传不会 400。
+- 两轮对话实测：回答逐字流式显示；**第二轮正常**（证明流式消息回传兼容）。
+- `pytest` → **105 passed, 1 skipped**（新增 `tests/test_messages.py` 6 例）。
+
+### 说明
+
+- **worker 的工具轨迹仍是"节点级"**（不是 token 级）—— 这是有意的：
+  trace 要的是每行一次工具调用，而不是 token 汤。流式的只有"给用户的回答"。
+- 回答流式输出后就不再渲染面板（`_drive` 返回 `started` 标记），避免重复显示。
+
+---
+
 ## v1 收尾状态（M0–M4 全部完成）
 
 计划中的 5 个里程碑已全部落地，`xx-code` 现在能：

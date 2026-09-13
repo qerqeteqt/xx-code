@@ -170,13 +170,22 @@ def _final_answer(messages: list, since: int = 0) -> str:
     return "(本轮没有产生回答)"
 
 
-def _stream_once(graph, payload, config, seen: set, label: str | None = None):
+def _stream_once(graph, payload, config, seen: set, streamed: dict,
+                 label: str | None = None):
     """跑一轮 stream；返回捕获到的 interrupt 值（没有则 None）。
 
+    用 `["updates", "custom"]` 两种模式并用：
+    - `updates`：节点完成的增量（工具调用轨迹），**interrupt 只在这个模式里出现**
+    - `custom` ：supervisor 边生成边推出来的回答增量（逐字显示）
+
+    `streamed` 记录本轮是否已经在流式输出回答（用于决定要不要再渲染最终面板）。
     label 用于把节点名统一显示成角色名（--agent 模式下顶层是 worker 自身，
     节点名会是内部的 model/tools）。
     """
-    for chunk in graph.stream(payload, config, stream_mode="updates"):
+    for mode, chunk in graph.stream(payload, config, stream_mode=["updates", "custom"]):
+        if mode == "custom":
+            _print_answer_delta(chunk, streamed)
+            continue
         if "__interrupt__" in chunk:
             return chunk["__interrupt__"][0].value
         for node, update in chunk.items():
@@ -184,19 +193,34 @@ def _stream_once(graph, payload, config, seen: set, label: str | None = None):
     return None
 
 
-def _drive(graph, payload, config, label: str | None = None) -> None:
+def _print_answer_delta(chunk, streamed: dict) -> None:
+    """打印回答的流式增量（supervisor 通过 get_stream_writer 推出来的）。"""
+    if not (isinstance(chunk, dict) and chunk.get("type") == "answer_delta"):
+        return
+    if not streamed.get("started"):
+        console.print()  # 与上面的工具轨迹隔开
+        streamed["started"] = True
+    console.print(chunk["text"], end="", markup=False, highlight=False)
+
+
+def _drive(graph, payload, config, label: str | None = None) -> dict:
     """驱动图跑完，遇到危险命令就暂停询问，然后恢复。
 
     `seen` 跨 resume 保留，否则中断恢复后会把中断前的消息重复打印。
+    返回值里的 `started` 表示本轮回答是否已经流式输出过。
     """
     from langgraph.types import Command
 
     seen: set = set()
+    streamed: dict = {}
     while True:
-        pending = _stream_once(graph, payload, config, seen, label)
+        pending = _stream_once(graph, payload, config, seen, streamed, label)
         if pending is None:
-            return
+            break
         payload = Command(resume=_ask(pending))
+    if streamed.get("started"):
+        console.print()  # 收尾换行
+    return streamed
 
 
 def _check_pg(dsn: str | None) -> None:
@@ -242,12 +266,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         graph = build_graph(root, settings, checkpointer)
         config = {"configurable": {"thread_id": thread_id}, "recursion_limit": RECURSION_LIMIT}
         base = len(graph.get_state(config).values.get("messages", []))
-        _drive(graph, {"messages": [HumanMessage(args.task)], "attempts": 0}, config)
+        streamed = _drive(
+            graph, {"messages": [HumanMessage(args.task)], "attempts": 0}, config
+        )
         final = _final_answer(
             graph.get_state(config).values.get("messages", []), since=base
         )
 
-    console.print(Panel(final, title="最终结论", border_style="green"))
+    # 回答若已边生成边显示，就不再重复渲染面板
+    if not streamed.get("started"):
+        console.print(Panel(final, title="最终结论", border_style="green"))
     return 0
 
 
@@ -271,10 +299,14 @@ def cmd_agent(args: argparse.Namespace) -> int:
     console.print(f"[dim]仓库[/] {root}\n[dim]任务[/] {args.task}")
 
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": RECURSION_LIMIT}
-    _drive(worker, {"messages": [HumanMessage(args.task)]}, config, label=args.agent)
+    streamed = _drive(worker, {"messages": [HumanMessage(args.task)]}, config, label=args.agent)
     final = _final_answer(worker.get_state(config).values.get("messages", []))
 
-    console.print(Panel(final, title=f"{args.agent} 输出", border_style=ROLE_STYLE.get(args.agent, "white")))
+    if not streamed.get("started"):
+        console.print(
+            Panel(final, title=f"{args.agent} 输出",
+                  border_style=ROLE_STYLE.get(args.agent, "white"))
+        )
     return 0
 
 
@@ -342,16 +374,17 @@ def cmd_chat(args: argparse.Namespace) -> int:
 
             base = len(graph.get_state(config).values.get("messages", []))
             try:
-                _drive(graph, payload, config)
+                streamed = _drive(graph, payload, config)
             except RuntimeError as exc:
                 # 单轮出错不该终结整个会话
                 console.print(f"[red]本轮出错：[/]{escape(str(exc))}\n")
                 continue
 
-            final = _final_answer(
-                graph.get_state(config).values.get("messages", []), since=base
-            )
-            console.print(Panel(final, title="最终结论", border_style="green"))
+            if not streamed.get("started"):
+                final = _final_answer(
+                    graph.get_state(config).values.get("messages", []), since=base
+                )
+                console.print(Panel(final, title="最终结论", border_style="green"))
 
     console.print("\n[dim]会话已保存（内容在 PostgreSQL 里，退出不会丢）。下次继续：[/]")
     console.print(f"  [cyan]python -m code_agent.cli --chat --repo {root}[/]")

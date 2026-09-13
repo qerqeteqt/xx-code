@@ -27,7 +27,7 @@ from langgraph.graph import END
 from langgraph.types import Command
 from pydantic import BaseModel, ValidationError
 
-from code_agent.messages import text_of
+from code_agent.messages import normalize_content, text_of
 
 MAX_ATTEMPTS = 8
 
@@ -153,32 +153,75 @@ def _recent_messages(messages: list, turns: int = 2) -> list:
     return messages[start:]
 
 
+def _text_delta(chunk) -> str:
+    """从流式 chunk 里取出**正文**增量（跳过 thinking 块，否则满屏内心活动）。"""
+    content = chunk.content
+    if isinstance(content, str):
+        return content
+    parts: list[str] = []
+    for block in content or []:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block.get("text", ""))
+    return "".join(parts)
+
+
+def _stream_writer():
+    """取 LangGraph 的 custom 流写入器；不在流式上下文里时返回 None。"""
+    try:
+        from langgraph.config import get_stream_writer
+
+        return get_stream_writer()
+    except Exception:  # noqa: BLE001 - 非流式调用（如单测）下没有 writer
+        return None
+
+
 def _answer_to_user(llm, messages: list) -> list:
-    """收尾时由 supervisor 直接给用户一个回答。
+    """收尾时由 supervisor 直接给用户一个回答（**流式**生成，边生成边显示）。
 
     为什么需要它：三个 worker 都是工具驱动的，遇到"你刚才改了什么？"这类**提问**
     没人能答 —— 若只是静默 END，CLI 会把上一轮的旧报告当成答案显示（实测如此）。
     这里让模型生成真正的 AIMessage（不是手工构造，因此不违反思考模型的约束）。
+
+    为什么用 `stream` 而不是 `invoke`：答案是节点内部调用生成的，**不会**出现在
+    `stream_mode="messages"` 里，只有自己把增量推给 `get_stream_writer()` 才能在
+    CLI 上逐字显示。
     """
+    prompt = [
+        SystemMessage(_ANSWER),
+        *_recent_messages(messages),
+        HumanMessage(_ANSWER_TRIGGER),
+    ]
+    writer = _stream_writer()
     try:
-        reply = llm.invoke([
-            SystemMessage(_ANSWER),
-            *_recent_messages(messages),
-            HumanMessage(_ANSWER_TRIGGER),
-        ])
+        if writer is None:
+            reply = llm.invoke(prompt)
+        else:
+            accumulated = None
+            for chunk in llm.stream(prompt):
+                accumulated = chunk if accumulated is None else accumulated + chunk
+                delta = _text_delta(chunk)
+                if delta:
+                    writer({"type": "answer_delta", "text": delta})
+            reply = accumulated
     except Exception as exc:  # noqa: BLE001 - 回答失败也要能正常收尾
         # 必须打出来：曾因为静默吞掉这个异常，导致用户看到的是上一轮的旧回答
         print(f"[supervisor] 生成回答失败：{type(exc).__name__}: {str(exc)[:120]}")
         return []
-    if not isinstance(reply, AIMessage):
+
+    if reply is None:
         return []
-    # id 必须**逐轮唯一**。曾用 `supervisor-answer-{attempts}`，而 attempts 每轮重置，
-    # 于是第二轮的 id 与第一轮相同 → add_messages 按 id 去重，把新回答覆盖到旧位置，
-    # CLI 取"最后一条 AI 消息"就拿到了旧回答（实测踩到），还会污染历史。
-    # 用当前最后一条消息的 id 作锚，既逐轮唯一，又在同一状态重跑时保持幂等。
+    # 流式累加的 content 是 str/dict 混合形态，必须规范化后再存，否则下一轮发回 API 可能报错
     anchor = getattr(messages[-1], "id", None) or uuid.uuid4().hex
-    reply.id = f"supervisor-answer-{anchor}"
-    return [reply]
+    return [AIMessage(
+        content=normalize_content(reply.content),
+        # id 必须**逐轮唯一**。曾用 `supervisor-answer-{attempts}`，而 attempts 每轮重置，
+        # 于是第二轮的 id 与第一轮相同 → add_messages 按 id 去重，把新回答覆盖到旧位置，
+        # CLI 取"最后一条 AI 消息"就拿到了旧回答（实测踩到），还会污染历史。
+        # 用当前最后一条消息的 id 作锚，既逐轮唯一，又在同一状态重跑时保持幂等。
+        id=f"supervisor-answer-{anchor}",
+    )]
 
 
 def make_supervisor(llm, max_attempts: int = MAX_ATTEMPTS):

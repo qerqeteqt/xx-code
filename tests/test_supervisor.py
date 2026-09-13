@@ -8,6 +8,7 @@ from __future__ import annotations
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.graph import END
 
+from code_agent.messages import text_of
 from code_agent.supervisor import make_supervisor
 
 
@@ -52,8 +53,8 @@ def test_finish_produces_user_facing_answer(scripted):
     assert cmd.goto == END
     reply = cmd.update["messages"][0]
     assert isinstance(reply, AIMessage)
-    assert "改了 calc.py" in reply.content
-    # 确定性 id：节点在 resume 后会重跑，靠 id 去重避免同一条回答被追加两次
+    assert "改了 calc.py" in text_of(reply)
+    # id 逐轮唯一（锚在当前最后一条消息的 id 上），既是 resume 幂等、又不会跨轮覆盖
     assert reply.id.startswith("supervisor-answer-")
 
 
@@ -120,8 +121,8 @@ def test_answer_ids_do_not_collide_across_turns(scripted):
     })
 
     assert turn1.update["messages"][0].id != turn2.update["messages"][0].id
-    assert "回答A" in turn1.update["messages"][0].content
-    assert "回答B" in turn2.update["messages"][0].content
+    assert "回答A" in text_of(turn1.update["messages"][0])
+    assert "回答B" in text_of(turn2.update["messages"][0])
 
 
 def test_digest_is_bounded(scripted):
