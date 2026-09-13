@@ -10,7 +10,10 @@ Supervisor 调度三个 Agent —— **Explorer**（定位代码）/ **Coder**�
 
 可多轮对话（短期记忆）、回答流式输出、会话持久化在 PostgreSQL、支持联网检索。
 **105 passed, 1 skipped** —— 含 supervisor 路由 / 图接线 / HITL / 并发编辑的回归测试。
-已知未完成项见 [DEVLOG.md](DEVLOG.md) 末尾。
+
+**当前编排仍是「方案 A」**：所有 agent 共享 `messages` 黑板（见 `state.py`），
+因此存在上下文膨胀与交叉污染；「方案 B」（各 worker 独立 `findings`/`edits`/`verdict` 通道）
+**尚未实现**。完整未完成项清单见 [DEVLOG.md](DEVLOG.md) 末尾的「v1 收尾状态」。
 
 ## 环境
 
