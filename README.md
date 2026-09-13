@@ -9,11 +9,12 @@ Supervisor 调度三个 Agent —— **Explorer**（定位代码）/ **Coder**�
 ## 状态
 
 可多轮对话（短期记忆）、回答流式输出、会话持久化在 PostgreSQL、支持联网检索。
-**105 passed, 1 skipped** —— 含 supervisor 路由 / 图接线 / HITL / 并发编辑的回归测试。
+**108 passed, 1 skipped** —— 含 supervisor 路由 / 图接线 / HITL / 并发编辑 / 剪枝的回归测试。
 
-**当前编排仍是「方案 A」**：所有 agent 共享 `messages` 黑板（见 `state.py`），
-因此存在上下文膨胀与交叉污染；「方案 B」（各 worker 独立 `findings`/`edits`/`verdict` 通道）
-**尚未实现**。完整未完成项清单见 [DEVLOG.md](DEVLOG.md) 末尾的「v1 收尾状态」。
+编排已升级到**方案 B**：共享黑板里**只保留人话**（任务 / 指令 / 各成员汇报），
+worker 内部的工具调用与结果会在 supervisor 下一轮开始时被剪掉（`supervisor.prune_scratchpad`）。
+实测同任务的持久化状态从 44 条消息（含 24 条工具消息）降到 **8 条消息、0 条工具消息**。
+剩余待办见 [DEVLOG.md](DEVLOG.md) 末尾的「v1 收尾状态」。
 
 ## 环境
 
@@ -102,7 +103,8 @@ tests/             # 105 passed
 
 - **最小权限**：只有 Verifier 能执行命令、只有 Coder 能改代码 —— 所以 HITL 只需挂一处。
 - **调度**：Supervisor 用 `Command(goto=...)` 直接路由，不写 `conditional_edges`；worker 干完回到它。
-- **上下文压缩**：工具内源头截断 → 清旧工具结果 → supervisor 只看摘要（带长度上限）。
+- **隔离（方案 B）**：黑板只留人话，工具草稿成对剪掉 —— 止住上下文膨胀，也避免成员互相模仿。
+- **上下文压缩**：工具内源头截断 → 剪掉旧草稿 → supervisor 只看摘要（带长度上限）。
 - **工具失败**：工具内部捕获并回传错误给模型，但必须放行 `GraphBubbleUp`（否则 `interrupt` 失效）。
 - **并发**：同一轮多个工具调用会**并行执行**，因此文件读-改-写必须串行化。
 - **持久化**：`PostgresSaver` + `thread_id`；会话跨进程续跑，这就是"短期记忆"。

@@ -5,11 +5,11 @@
 
 from __future__ import annotations
 
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.graph import END
 
 from code_agent.messages import text_of
-from code_agent.supervisor import make_supervisor
+from code_agent.supervisor import make_supervisor, prune_scratchpad
 
 
 def _route(model, *contents: str, attempts: int = 0, extra: list | None = None,
@@ -123,6 +123,44 @@ def test_answer_ids_do_not_collide_across_turns(scripted):
     assert turn1.update["messages"][0].id != turn2.update["messages"][0].id
     assert "回答A" in text_of(turn1.update["messages"][0])
     assert "回答B" in text_of(turn2.update["messages"][0])
+
+
+def test_prune_removes_tool_traffic_but_keeps_reports():
+    """方案 B：剪掉工具草稿，只留人话（任务 / 汇报）。"""
+    task = HumanMessage("任务", id="h1")
+    tool_ai = AIMessage(
+        content="", id="a1",
+        tool_calls=[{"name": "read_file", "args": {}, "id": "c1"}],
+    )
+    tool_result = ToolMessage(content="文件内容", tool_call_id="c1", id="t1")
+    report = AIMessage(content="我读了 calc.py", id="a2")
+
+    removed = {m.id for m in prune_scratchpad([task, tool_ai, tool_result, report])}
+
+    assert removed == {"a1", "t1"}, "带 tool_calls 的 AIMessage 必须与它的 ToolMessage 成对剪掉"
+    assert "h1" not in removed, "用户任务要留"
+    assert "a2" not in removed, "纯文本汇报要留"
+
+
+def test_prune_handles_unpaired_tool_call():
+    """没有配对结果的调用也要整个删掉，不能只删一半（否则下次发回 API 会报配对错误）。"""
+    only_call = AIMessage(
+        content="", id="a9",
+        tool_calls=[{"name": "x", "args": {}, "id": "c9"}],
+    )
+    assert {m.id for m in prune_scratchpad([only_call])} == {"a9"}
+
+
+def test_made_edits_is_recorded_even_though_scratchpad_is_pruned(scripted):
+    """剪掉草稿后"是否改过代码"就翻不到了 —— 必须由 supervisor 在同一批里记进 state。"""
+    edited = AIMessage(
+        content="", id="a1",
+        tool_calls=[{"name": "edit_file", "args": {}, "id": "e1"}],
+    )
+    cmd = _route(scripted, '{"next": "explorer", "reason": "r"}', extra=[edited])
+
+    assert cmd.update["made_edits"] is True
+    assert "a1" in {getattr(m, "id", None) for m in cmd.update["messages"]}, "同一批里要把它剪掉"
 
 
 def test_digest_is_bounded(scripted):

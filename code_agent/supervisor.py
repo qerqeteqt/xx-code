@@ -22,7 +22,13 @@ import re
 import uuid
 from typing import Literal
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langgraph.graph import END
 from langgraph.types import Command
 from pydantic import BaseModel, ValidationError
@@ -129,11 +135,36 @@ def _has_edits(messages: list) -> bool:
     )
 
 
-def _rule_based(messages: list, attempts: int) -> Route:
-    """确定性兜底路由（仅在模型路由不可用时使用）。"""
+def prune_scratchpad(messages: list) -> list:
+    """找出可以安全删除的「工具草稿」：带 `tool_calls` 的 AIMessage 及配对的 ToolMessage。
+
+    这是方案 B 的核心手段 —— 让共享 `messages` 里只留人话（任务 / 指令 / 汇报），
+    不再堆积别人的工具调用与结果。好处：上下文不再随任务膨胀、成员之间不再交叉污染。
+
+    **必须成对删除**：留下带 `tool_calls` 的 AIMessage 却删掉它的 ToolMessage，
+    下次发回 API 会因 tool_use ⇄ tool_result 不配对而报错。
+    顺带地，这也让 `_has_edits` 失效 —— 所以另用 `made_edits` 记录（见 state.py）。
+    """
+    call_ids: set[str] = set()
+    dropped: list = []
+    for message in messages:
+        if isinstance(message, AIMessage) and message.tool_calls:
+            dropped.append(message)
+            call_ids.update(c["id"] for c in message.tool_calls if c.get("id"))
+    for message in messages:
+        if isinstance(message, ToolMessage) and message.tool_call_id in call_ids:
+            dropped.append(message)
+    return [RemoveMessage(id=m.id) for m in dropped if getattr(m, "id", None)]
+
+
+def _rule_based(attempts: int, made_edits: bool) -> Route:
+    """确定性兜底路由（仅在模型路由不可用时使用）。
+
+    注意不能用 `_has_edits(messages)`：草稿已被剪掉，翻不到编辑调用了。
+    """
     if attempts == 0:
         return Route(next="explorer", reason="兜底：先定位代码")
-    if not _has_edits(messages):
+    if not made_edits:
         return Route(next="coder", reason="兜底：尚无任何改动")
     return Route(next="verifier", reason="兜底：有改动，交给验证")
 
@@ -175,6 +206,23 @@ def _stream_writer():
         return get_stream_writer()
     except Exception:  # noqa: BLE001 - 非流式调用（如单测）下没有 writer
         return None
+
+
+def _emit_usage(message) -> None:
+    """把一次模型调用的 token 用量推给 CLI 统计。
+
+    为什么需要：**路由调用**的结果不进 state（只落一条指令），CLI 无从看到它的用量 ——
+    不主动上报的话，每轮的调用次数和 token 都会被少算。
+    """
+    writer = _stream_writer()
+    usage = getattr(message, "usage_metadata", None) or {}
+    if writer is None or not usage:
+        return
+    writer({
+        "type": "usage",
+        "input_tokens": int(usage.get("input_tokens") or 0),
+        "output_tokens": int(usage.get("output_tokens") or 0),
+    })
 
 
 def _answer_to_user(llm, messages: list) -> list:
@@ -234,11 +282,17 @@ def make_supervisor(llm, max_attempts: int = MAX_ATTEMPTS):
         attempts = state.get("attempts", 0) + 1
         digest = _digest(messages)
 
+        # 方案 B：把上一位成员留下的「工具草稿」剪掉，只保留人话。
+        # 剪之前先观察一次是否发生了代码改动（剪掉后就翻不到了）。
+        made_edits = bool(state.get("made_edits")) or _has_edits(messages)
+        base = {"attempts": attempts, "made_edits": made_edits}
+        removals = prune_scratchpad(messages)
+
         if attempts > max_attempts:
             print(f"[supervisor] 已达最大轮次 {max_attempts}，结束。")
             return Command(
                 goto=END,
-                update={"attempts": attempts, "messages": _answer_to_user(llm, messages)},
+                update={**base, "messages": [*removals, *_answer_to_user(llm, messages)]},
             )
 
         prompt = [
@@ -246,23 +300,25 @@ def make_supervisor(llm, max_attempts: int = MAX_ATTEMPTS):
             HumanMessage(f"{digest}\n\n请决定下一步（只输出 JSON）。"),
         ]
         try:
-            route = _parse_route(text_of(llm.invoke(prompt)))
+            raw = llm.invoke(prompt)
+            _emit_usage(raw)
+            route = _parse_route(text_of(raw))
         except Exception:  # noqa: BLE001 - 模型调用失败也要能降级
             route = None
         if route is None:
-            route = _rule_based(messages, attempts - 1)
+            route = _rule_based(attempts - 1, made_edits)
 
         print(f"[supervisor] 下一步 → {route.next}（{route.reason}）")
         if route.next == "finish":
             return Command(
                 goto=END,
-                update={"attempts": attempts, "messages": _answer_to_user(llm, messages)},
+                update={**base, "messages": [*removals, *_answer_to_user(llm, messages)]},
             )
 
         # 以 HumanMessage 注入具体指令：给目标成员一个新鲜的祈使句。
-        # 实测不这么做时，成员会看到上一位的结论而"照抄不动手"（方案 A 共享历史的固有代价）。
+        # 实测不这么做时，成员会看到上一位的结论而"照抄不动手"。
         # 用 HumanMessage 而非 AIMessage，是因为思考模型不允许手工构造 assistant 消息。
         directive = HumanMessage(f"[Supervisor 指令] {route.instruction or route.reason}")
-        return Command(goto=route.next, update={"attempts": attempts, "messages": [directive]})
+        return Command(goto=route.next, update={**base, "messages": [*removals, directive]})
 
     return supervisor

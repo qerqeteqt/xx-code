@@ -150,20 +150,6 @@ def _new_stats() -> dict:
     return {"calls": 0, "in": 0, "out": 0}
 
 
-def _usage_totals(messages: list) -> dict:
-    """把一批消息里的 token 用量加总（只算带 usage_metadata 的 AIMessage）。"""
-    stats = _new_stats()
-    for message in messages:
-        if not isinstance(message, AIMessage):
-            continue
-        usage = getattr(message, "usage_metadata", None) or {}
-        if usage:
-            stats["calls"] += 1
-            stats["in"] += int(usage.get("input_tokens") or 0)
-            stats["out"] += int(usage.get("output_tokens") or 0)
-    return stats
-
-
 def _print_usage(stats: dict, title: str) -> None:
     """打印一行用量统计。注意 output 里也包含 thinking 的 token，所以数字偏大属正常。"""
     if not stats["calls"]:
@@ -191,14 +177,18 @@ def _ask(interrupt_value) -> str:
     return "approve" if answer in ("y", "yes") else "reject"
 
 
-def _final_answer(messages: list, since: int = 0) -> str:
+def _final_answer(messages: list, before_ids: set | None = None) -> str:
     """取最后一条 AI 文本。
 
-    `since` 之前（以往轮次）的消息一律不看 —— 否则本轮万一没产出回答，
-    就会把**上一轮的旧回答**当成结果展示（实测踩到过）。
+    `before_ids` 是**本轮开始前**已有消息的 id 集合 —— 只认这之后新产生的消息，
+    否则本轮万一没产出回答，就会把**上一轮的旧回答**当成结果展示（实测踩到过）。
+
+    用 id 集合而不是下标：方案 B 会在轮内**剪掉旧消息**，下标会漂移。
     """
-    for message in reversed(messages[since:]):
+    for message in reversed(messages):
         if not isinstance(message, AIMessage):
+            continue
+        if before_ids and getattr(message, "id", None) in before_ids:
             continue
         text = text_of(message).strip()
         if text:
@@ -221,7 +211,7 @@ def _stream_once(graph, payload, config, seen: set, turn: dict,
     """
     for mode, chunk in graph.stream(payload, config, stream_mode=["updates", "custom"]):
         if mode == "custom":
-            _print_answer_delta(chunk, turn)
+            _handle_custom(chunk, turn)
             continue
         if "__interrupt__" in chunk:
             return chunk["__interrupt__"][0].value
@@ -230,14 +220,24 @@ def _stream_once(graph, payload, config, seen: set, turn: dict,
     return None
 
 
-def _print_answer_delta(chunk, turn: dict) -> None:
-    """打印回答的流式增量（supervisor 通过 get_stream_writer 推出来的）。"""
-    if not (isinstance(chunk, dict) and chunk.get("type") == "answer_delta"):
+def _handle_custom(chunk, turn: dict) -> None:
+    """处理 supervisor 通过 `get_stream_writer()` 推来的 custom 块。
+
+    - `answer_delta`：回答的正文增量，逐字打印
+    - `usage`      ：一次模型调用的用量（**路由调用**不在 state 里，只能这样上报）
+    """
+    if not isinstance(chunk, dict):
         return
-    if not turn.get("started"):
-        console.print()  # 与上面的工具轨迹隔开
-        turn["started"] = True
-    console.print(chunk["text"], end="", markup=False, highlight=False)
+    kind = chunk.get("type")
+    if kind == "answer_delta":
+        if not turn.get("started"):
+            console.print()  # 与上面的工具轨迹隔开
+            turn["started"] = True
+        console.print(chunk["text"], end="", markup=False, highlight=False)
+    elif kind == "usage":
+        turn["calls"] += 1
+        turn["in"] += int(chunk.get("input_tokens") or 0)
+        turn["out"] += int(chunk.get("output_tokens") or 0)
 
 
 def _drive(graph, payload, config, label: str | None = None) -> dict:
@@ -302,12 +302,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     with open_checkpointer(settings.pg_dsn) as checkpointer:
         graph = build_graph(root, settings, checkpointer)
         config = {"configurable": {"thread_id": thread_id}, "recursion_limit": RECURSION_LIMIT}
-        base = len(graph.get_state(config).values.get("messages", []))
+        base = {m.id for m in graph.get_state(config).values.get("messages", [])}
         streamed = _drive(
-            graph, {"messages": [HumanMessage(args.task)], "attempts": 0}, config
+            graph,
+            {"messages": [HumanMessage(args.task)], "attempts": 0, "made_edits": False},
+            config,
         )
         final = _final_answer(
-            graph.get_state(config).values.get("messages", []), since=base
+            graph.get_state(config).values.get("messages", []), before_ids=base
         )
 
     # 回答若已边生成边显示，就不再重复渲染面板
@@ -381,6 +383,8 @@ def cmd_chat(args: argparse.Namespace) -> int:
     with open_checkpointer(settings.pg_dsn) as checkpointer:
         graph = build_graph(root, settings, checkpointer)
         _save_last_session(str(root), thread_id)
+        # 进程内累加，而不是回头读库求和 —— 方案 B 会剪掉带用量的消息，读库会少算
+        session = _new_stats()
 
         while True:
             try:
@@ -402,9 +406,9 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 "configurable": {"thread_id": thread_id},
                 "recursion_limit": RECURSION_LIMIT,
             }
-            payload = {"messages": [HumanMessage(line)], "attempts": 0}
+            payload = {"messages": [HumanMessage(line)], "attempts": 0, "made_edits": False}
 
-            base = len(graph.get_state(config).values.get("messages", []))
+            base = {m.id for m in graph.get_state(config).values.get("messages", [])}
             try:
                 streamed = _drive(graph, payload, config)
             except RuntimeError as exc:
@@ -412,16 +416,16 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 console.print(f"[red]本轮出错：[/]{escape(str(exc))}\n")
                 continue
 
+            for key in ("calls", "in", "out"):
+                session[key] += streamed.get(key, 0)
+
             if not streamed.get("started"):
                 final = _final_answer(
-                    graph.get_state(config).values.get("messages", []), since=base
+                    graph.get_state(config).values.get("messages", []), before_ids=base
                 )
                 console.print(Panel(final, title="最终结论", border_style="green"))
 
-        # 仍在 checkpointer 上下文内，才能读状态
-        session = _usage_totals(graph.get_state(config).values.get("messages", []))
-
-    _print_usage(session, "本会话累计")
+    _print_usage(session, "本次运行累计")
     console.print("\n[dim]会话已保存（内容在 PostgreSQL 里，退出不会丢）。下次继续：[/]")
     if Path.cwd() == Path(root.root):
         console.print("  [cyan]xx-code[/]  [dim]（当前目录就是该仓库，会自动续接本次会话）[/]")
