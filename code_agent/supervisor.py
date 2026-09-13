@@ -212,17 +212,23 @@ def _stream_writer():
         return None
 
 
+def _emit(payload: dict) -> None:
+    """把事件推给 CLI（非流式上下文里没有 writer，忽略即可）。"""
+    writer = _stream_writer()
+    if writer is not None:
+        writer(payload)
+
+
 def _emit_usage(message) -> None:
     """把一次模型调用的 token 用量推给 CLI 统计。
 
     为什么需要：**路由调用**的结果不进 state（只落一条指令），CLI 无从看到它的用量 ——
     不主动上报的话，每轮的调用次数和 token 都会被少算。
     """
-    writer = _stream_writer()
     usage = getattr(message, "usage_metadata", None) or {}
-    if writer is None or not usage:
+    if not usage:
         return
-    writer({
+    _emit({
         "type": "usage",
         "input_tokens": int(usage.get("input_tokens") or 0),
         "output_tokens": int(usage.get("output_tokens") or 0),
@@ -293,7 +299,8 @@ def make_supervisor(llm, max_attempts: int = MAX_ATTEMPTS):
         removals = prune_scratchpad(messages)
 
         if attempts > max_attempts:
-            print(f"[supervisor] 已达最大轮次 {max_attempts}，结束。")
+            _emit({"type": "decision", "next": "finish",
+                   "reason": f"已达最大轮次 {max_attempts}，强制结束"})
             return Command(
                 goto=END,
                 update={**base, "messages": [*removals, *_answer_to_user(llm, messages)]},
@@ -312,7 +319,8 @@ def make_supervisor(llm, max_attempts: int = MAX_ATTEMPTS):
         if route is None:
             route = _rule_based(attempts - 1, made_edits)
 
-        print(f"[supervisor] 下一步 → {route.next}（{route.reason}）")
+        # 决策以事件上报，由 CLI 负责显示与记录（库里不再直接 print）
+        _emit({"type": "decision", "next": route.next, "reason": route.reason})
         if route.next == "finish":
             return Command(
                 goto=END,

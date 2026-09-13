@@ -74,8 +74,15 @@ xx-code --history                          # 查看历史：列出会话
 xx-code --history --thread-id <id>         # 查看某次会话的完整记录（含被剪掉的工具调用与结果）
 ```
 
-记录存在 `<项目根>/.code_agent_sessions/<thread_id>.jsonl`（**可以直接用编辑器打开看**）。
-一步一行、append-only；`--history` 会把被剪掉的工具调用也一并还原出来。
+记录存在 `<项目根>/.code_agent_sessions/年/月/日/`，一个会话两个文件：
+
+```
+163135-运行测试，把失败的修好-1a078c.jsonl   ← 状态（机器用，是 msgpack 快照，看着像乱码）
+163135-运行测试，把失败的修好-1a078c.md      ← 记录（人看：一问一答 + 工具调用 + 汇报）
+```
+
+**要读对话就看 `.md`**（可直接用编辑器打开）；`.jsonl` 是给 checkpointer 用的，别去读它。
+`--history` 可以把被剪掉的工具调用也一并还原出来。
 
 找不到 `xx-code` 就说明没激活环境（先 `conda activate langgraph`），
 或用等价的 `python -m code_agent.cli`。

@@ -66,6 +66,7 @@ class JsonlSaver(InMemorySaver):
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self._paths: dict[str, Path] = {}   # thread_id → 文件
         self._labels: dict[str, str] = {}   # thread_id → 文件名里的摘要（供 set_label 用）
+        self._meta_written: set[str] = set()  # 已经写过 meta 的会话（避免重复注入）
         self._replay_all()
 
     # ---------- 会话定位 ----------
@@ -87,6 +88,19 @@ class JsonlSaver(InMemorySaver):
     def set_label(self, thread_id: str, label: str) -> None:
         """给会话设一个可读摘要 —— **必须在第一次落盘之前调用**（文件名要用它）。"""
         self._labels[thread_id] = label
+
+    def transcript_path(self, thread_id: str) -> Path:
+        """人可读记录文件的路径（与状态文件同名，扩展名 .md）。
+
+        会在此刻**预定**该会话的文件路径，保证之后再落盘用的是同一个名字
+        （否则先写记录、后建状态文件时，两次算出的时间戳可能不同，会分成两个文件）。
+        """
+        with _APPEND_LOCK:
+            path = self._paths.get(thread_id)
+            if path is None:
+                path = self._new_path(thread_id)
+                self._paths[thread_id] = path
+        return path.with_suffix(".md")
 
     def _new_path(self, thread_id: str) -> Path:
         now = datetime.now()
@@ -113,7 +127,9 @@ class JsonlSaver(InMemorySaver):
             if path is None:
                 path = self._new_path(thread_id)
                 self._paths[thread_id] = path
+            if thread_id not in self._meta_written:
                 # 第一行带上元信息：真正的 thread_id、摘要、创建时间
+                self._meta_written.add(thread_id)
                 record = {
                     **record,
                     "meta": {
@@ -193,6 +209,7 @@ class JsonlSaver(InMemorySaver):
 
         if thread_id:
             self._paths[thread_id] = path
+            self._meta_written.add(thread_id)
         else:
             print(f"[JsonlSaver] {path.name} 缺少 meta.thread_id，已跳过整个文件")
         if broken:

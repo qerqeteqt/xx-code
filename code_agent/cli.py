@@ -21,6 +21,7 @@ from rich.panel import Panel
 
 from code_agent.config import SESSION_DIR
 from code_agent.messages import text_of
+from code_agent.transcript import Transcript
 
 AGENT_ROLES = ("explorer", "coder", "verifier")
 
@@ -136,12 +137,22 @@ def _print_update(node: str, update, seen: set | None = None,
                 stats["calls"] += 1
                 stats["in"] += int(usage.get("input_tokens") or 0)
                 stats["out"] += int(usage.get("output_tokens") or 0)
-        for call in getattr(message, "tool_calls", None) or []:
+        tool_calls = getattr(message, "tool_calls", None) or []
+        for call in tool_calls:
             raw = json.dumps(call.get("args", {}), ensure_ascii=False)
             console.print(
                 f"[{style}]{node:<10}[/][dim]→[/] {call.get('name')}"
                 f"[dim]({escape(raw[:140])})[/]"
             )
+
+        # 顺带写进人可读记录（supervisor 的最终回答由 _drive 统一记录，这里跳过）
+        transcript = (stats or {}).get("transcript")
+        if transcript is not None and isinstance(message, AIMessage):
+            if tool_calls:
+                transcript.tools(node, tool_calls)
+            text = text_of(message).strip()
+            if text and not (message.id or "").startswith("supervisor-answer-"):
+                transcript.report(node, text)
 
 
 def _new_stats() -> dict:
@@ -257,32 +268,45 @@ def _stream_once(graph, payload, config, seen: set, turn: dict,
 def _handle_custom(chunk, turn: dict) -> None:
     """处理 supervisor 通过 `get_stream_writer()` 推来的 custom 块。
 
-    - `answer_delta`：回答的正文增量，逐字打印
-    - `usage`      ：一次模型调用的用量（**路由调用**不在 state 里，只能这样上报）
+    - `decision`     ：路由决策（supervisor 不再自己 print，由这里显示与记录）
+    - `answer_delta` ：回答的正文增量，逐字打印
+    - `usage`        ：一次模型调用的用量（**路由调用**不在 state 里，只能这样上报）
     """
     if not isinstance(chunk, dict):
         return
     kind = chunk.get("type")
-    if kind == "answer_delta":
+    transcript = turn.get("transcript")
+
+    if kind == "decision":
+        next_ = str(chunk.get("next", ""))
+        reason = str(chunk.get("reason", ""))
+        console.print(f"[bold cyan][supervisor][/] [dim]下一步 →[/] {next_}（{escape(reason)}）")
+        if transcript is not None:
+            transcript.decision(next_, reason)
+    elif kind == "answer_delta":
         if not turn.get("started"):
             console.print()  # 与上面的工具轨迹隔开
             turn["started"] = True
-        console.print(chunk["text"], end="", markup=False, highlight=False)
+        text = chunk["text"]
+        turn["answer"] = turn.get("answer", "") + text
+        console.print(text, end="", markup=False, highlight=False)
     elif kind == "usage":
         turn["calls"] += 1
         turn["in"] += int(chunk.get("input_tokens") or 0)
         turn["out"] += int(chunk.get("output_tokens") or 0)
 
 
-def _drive(graph, payload, config, label: str | None = None) -> dict:
+def _drive(graph, payload, config, label: str | None = None,
+           transcript: Transcript | None = None) -> dict:
     """驱动图跑完，遇到危险命令就暂停询问，然后恢复，最后打印本轮 token 用量。
 
     `seen` 跨 resume 保留，否则中断恢复后会把中断前的消息重复打印（用量也会重复计）。
+    `transcript` 传了就同时写一份人可读的 Markdown 记录。
     """
     from langgraph.types import Command
 
     seen: set = set()
-    turn: dict = {"started": False, **_new_stats()}
+    turn: dict = {"started": False, "answer": "", "transcript": transcript, **_new_stats()}
     while True:
         pending = _stream_once(graph, payload, config, seen, turn, label)
         if pending is None:
@@ -290,6 +314,8 @@ def _drive(graph, payload, config, label: str | None = None) -> dict:
         payload = Command(resume=_ask(pending))
     if turn.get("started"):
         console.print()  # 收尾换行
+    if transcript is not None and turn.get("answer"):
+        transcript.answer(turn["answer"])
     _print_usage(turn, "本轮")
     return turn
 
@@ -412,12 +438,17 @@ def cmd_run(args: argparse.Namespace) -> int:
         # 文件名里用第一句任务作摘要（只在会话首次落盘时生效）
         checkpointer.set_label(thread_id, args.task)
         _save_last_session(str(root), thread_id)  # 一次性任务也能被 --history 标上仓库、被下次续聊
+        transcript = Transcript(checkpointer.transcript_path(thread_id))
+        transcript.header(str(root), thread_id)
+        transcript.user(args.task)
+
         config = _config(thread_id, str(root))
         base = {m.id for m in graph.get_state(config).values.get("messages", [])}
         streamed = _drive(
             graph,
             {"messages": [HumanMessage(args.task)], "attempts": 0, "made_edits": False},
             config,
+            transcript=transcript,
         )
         final = _final_answer(
             graph.get_state(config).values.get("messages", []), before_ids=base
@@ -426,6 +457,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     # 回答若已边生成边显示，就不再重复渲染面板
     if not streamed.get("started"):
         console.print(Panel(final, title="最终结论", border_style="green"))
+        transcript.answer(final)  # 非流式路径也要记进记录文件
     return 0
 
 
@@ -519,9 +551,13 @@ def cmd_chat(args: argparse.Namespace) -> int:
             if not checkpointer.has_session(thread_id):
                 checkpointer.set_label(thread_id, line)
 
+            transcript = Transcript(checkpointer.transcript_path(thread_id))
+            transcript.header(str(root), thread_id)
+            transcript.user(line)
+
             base = {m.id for m in graph.get_state(config).values.get("messages", [])}
             try:
-                streamed = _drive(graph, payload, config)
+                streamed = _drive(graph, payload, config, transcript=transcript)
             except RuntimeError as exc:
                 # 单轮出错不该终结整个会话
                 console.print(f"[red]本轮出错：[/]{escape(str(exc))}\n")
@@ -535,6 +571,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
                     graph.get_state(config).values.get("messages", []), before_ids=base
                 )
                 console.print(Panel(final, title="最终结论", border_style="green"))
+                transcript.answer(final)
 
     _print_usage(session, "本次运行累计")
     console.print(f"\n[dim]会话已保存到 {SESSION_DIR}（退出不会丢）。下次继续：[/]")
