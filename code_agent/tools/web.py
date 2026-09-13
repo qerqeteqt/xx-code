@@ -12,15 +12,33 @@ from __future__ import annotations
 from langchain_core.tools import tool
 
 from code_agent.config import Settings
-from code_agent.tools._util import safe
+from code_agent.tools._util import is_transient, safe, with_retry
 
 MAX_RESULTS = 3
 MAX_CHARS = 2000
 MAX_CONTENT_CHARS = 400
 
 
+def _retry_reason(result) -> str:
+    """该重试就返回原因（错误类型名，会进重试日志）；不该重试返回空字符串。
+
+    Tavily **不抛异常**，而是把错误装进返回值：`{"error": Exception(...)}`。
+    所以要把里面的异常取出来再判断是不是瞬时的 —— 否则重试永远不会触发（实测踩到）。
+    401（key 不对）是 `ValueError` → 不重试；连不上是 `ConnectionError` → 重试。
+    """
+    if not isinstance(result, dict):
+        return ""
+    error = result.get("error")
+    if isinstance(error, BaseException) and is_transient(error):
+        return type(error).__name__
+    return ""
+
+
 def _format(result) -> str:
     """把 Tavily 的返回压成紧凑文本。"""
+    if isinstance(result, dict) and result.get("error"):
+        # 把错误如实回传给模型，让它自己决定下一步（换关键词 / 说明查不到）
+        return f"Error: 联网检索失败：{result['error']}"
     if isinstance(result, str):
         return result[:MAX_CHARS]
 
@@ -54,9 +72,16 @@ def build_web_tools(settings: Settings) -> list:
         用于查询仓库里查不到的信息：第三方库用法、报错含义、API 文档等。
         优先用仓库内检索，确认本地没有答案后再联网。
 
+        网络抖动/限流会自动重试；重试用尽则把错误返回给模型自行判断。
+
         Args:
             query: 检索关键词。
         """
-        return _format(tavily.invoke({"query": query}))
+        # 重试只包住网络调用这一句：检索是幂等的，重试安全。
+        # retry_if 用来识别 Tavily"把错误包在返回值里"的情况。
+        # 重试用尽后仍把错误当成结果返回，由模型自己判断下一步。
+        result = with_retry(tavily.invoke, {"query": query},
+                            retry_if=_retry_reason, label="web_search")
+        return _format(result)
 
     return [web_search]

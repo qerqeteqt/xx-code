@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from code_agent.config import Settings
-from code_agent.tools.web import MAX_CHARS, _format, build_web_tools
+from code_agent.tools.web import MAX_CHARS, _format, _retry_reason, build_web_tools
 
 
 def _settings(tavily_key: str | None) -> Settings:
@@ -37,3 +37,21 @@ def test_format_handles_plain_string():
 
 def test_format_handles_empty_results():
     assert _format({}) == "（无结果）"
+
+
+def test_retry_reason_reads_the_wrapped_exception():
+    """Tavily 不抛异常，把错误包在返回值里 —— 要取出里面的异常再分类。
+
+    返回的是"原因字符串"（会进重试日志），空字符串表示不该重试。
+    """
+    assert _retry_reason({"error": ConnectionResetError("连不上")}) == "ConnectionResetError"
+    assert _retry_reason({"error": ValueError("401 Unauthorized")}) == ""
+    assert _retry_reason({"results": []}) == ""
+    assert _retry_reason("普通字符串") == ""
+
+
+def test_format_returns_wrapped_error_to_the_model():
+    """重试用尽后，错误要如实回传给模型（而不是变成"（无结果）"让它瞎猜）。"""
+    out = _format({"error": ValueError("Error 401: Unauthorized")})
+    assert out.startswith("Error:")
+    assert "401" in out

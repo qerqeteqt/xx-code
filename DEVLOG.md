@@ -1134,6 +1134,60 @@ explorer  → web_search(...)          ← 用的是有边界的 Tavily，不再
 
 ---
 
+## 新增 — 工具失败分类与重试（2026-09-13）
+
+### 目标
+
+补上工具失败处理的另一半。原来的设计只有"回传给模型"（`safe` 兜住异常 → `Error: ...`），
+缺"分类 + 重试"。用户提的方案（分类 → 瞬时错误重试 3 次 → 否则交给模型）方向正确，
+这里落地。
+
+### 改动
+
+| 文件 | 说明 |
+|---|---|
+| `tools/_util.py` | 新增 `is_transient()`（错误分类）与 `with_retry()`（有界重试） |
+| `tools/web.py` | `web_search` 的网络调用套上重试；`_format` 把错误如实回传 |
+
+设计要点：
+
+- **只用于幂等操作** —— 目前只有联网检索。**`run_command` 绝不重试**：命令不幂等，
+  可能已经执行了一半（比如提交成功但读响应时超时），重试会造成重复副作用。
+- **指数退避 + 抖动**：`0.5s → 1s`（最多等 ~3.5 秒），避免多个调用同时重试撞在一起。
+- **`GraphBubbleUp` 立即放行** —— 这条是血泪换来的：`ToolRetryMiddleware` 当年就是
+  因为它被当成"可重试的失败"吞掉，导致 **HITL 暂停静默失效**（命令没执行、用户却收不到确认）。
+- **重试必须留日志**，否则线上失败时看不出它重试过。
+- 重试用尽后**仍把错误当成结果返回**，由模型自己决定下一步（换关键词 / 说明查不到）。
+
+### 验证（真实网络，不是 mock）
+
+```
+[retry] web_search 第 1 次失败（ConnectionError），0.6s 后重试
+[retry] web_search 第 2 次失败（ConnectionError），1.1s 后重试
+→ 回传给模型: Error: 联网检索失败：HTTPSConnectionPool(host='127.0.0.1', port=9): Max retries exceeded
+```
+
+401（key 不对）则**一次都不重试**，直接回传。`pytest` → **143 passed, 1 skipped**（新增 16 例）。
+
+### 备注与坑（两个都是"不实测就发现不了"）
+
+1. **Tavily 失败时不抛异常**，而是把错误包在返回值里：`{"error": Exception(...)}`
+   → 我的重试**永远不会触发**（对着异常写的）。而且**单测全过** —— 因为单测是隔离测
+   `with_retry` 的，没走真实调用。典型的"单测过、集成不工作"。
+   → 加 `retry_if` 参数：让"返回值里带错误"也能触发重试。
+2. **它包的错误是 `requests.exceptions.ConnectionError`** —— 它**不是**内置 `ConnectionError`
+   的子类，而是 `OSError` 的孙子（`ConnectionError → RequestException → OSError`）。
+   只认内置 `ConnectionError` 的话，**真实网络故障会被判成非瞬时、永不重试**。
+   → `is_transient` 补上"网络类的 `OSError`"，同时排除 `FileNotFoundError` / `PermissionError`
+   这些"重试没意义"的子类。
+3. **`retry_if` 允许返回字符串**（不只 bool）——返回的字符串会进重试日志，
+   于是日志里能看出"是 ConnectionError 还是别的"。
+
+> 教训：**这类"失败处理的正确性"必须用真实故障验证** —— 拿一个不可达地址、
+> 一个无效 key 去打真实的 API，比写十个 mock 测试都有用。
+
+---
+
 ## v1 收尾状态（M0–M4 全部完成）
 
 计划中的 5 个里程碑已全部落地，`xx-code` 现在能：
