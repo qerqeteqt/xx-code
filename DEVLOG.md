@@ -745,6 +745,50 @@ xx-code
 
 ---
 
+## 新增 — 每轮 token 用量统计（2026-09-13）
+
+### 目标
+
+用户希望每轮对话结束后能看到"这次用了多少 token"。
+
+### 结论：可行，且**不需要额外模型调用**
+
+LangChain 的 `AIMessage.usage_metadata` 就带 `input_tokens` / `output_tokens`。
+实测本端点两条路都有：
+- `invoke` → `usage_metadata` 与 `response_metadata['usage']` 都有
+- `stream` → 累加后 `usage_metadata` 有（**只有最后一个 chunk 带**）
+
+### 改动
+
+| 文件 | 说明 |
+|---|---|
+| `supervisor.py` | `_answer_to_user` 重建消息时把 `usage_metadata` 带上（之前只复制 content，把用量丢了） |
+| `cli.py` | `_print_update` 顺带累加用量（复用已有的按 id 去重，避免重复计）；新增 `_usage_totals()` / `_print_usage()`；每轮打印一行，`:q` 时打印会话累计；`_drive` 返回本轮统计 |
+
+### 实测
+
+```
+本轮：模型调用 5 次 · 输入 10,694 · 输出 1,459 · 合计 12,153 tokens
+...
+本会话累计：模型调用 5 次 · 输入 10,694 · 输出 1,459 · 合计 12,153 tokens
+```
+
+`pytest` → 105 passed, 1 skipped。
+
+### 备注与坑
+
+1. **只有最后一个流式 chunk 带 usage**（实测确认）→ 累加不会重复计数。
+   排查时一度以为"累加把用量翻倍了"，实际是两次独立调用的 thinking 长度不同。
+2. **`output_tokens` 包含 thinking 的 token** —— 所以"只回答了一句话却花掉上千输出 token"
+   是正常的，thinking 越长数字越大。这点要在 README 里说明，免得用户以为算错了。
+3. **"输入"是各次调用累加后的值（计费口径），不是上下文大小** ——
+   一次 ReAct 循环里每调一次模型都要重发上下文，所以 5 次调用的输入合计
+   会数倍于单次上下文。想表达"上下文多大"是另一回事。
+4. **旧会话（本次改动之前存的）没有 `usage_metadata`** → 累计会偏小；
+   新会话才准。没有去回填历史数据。
+
+---
+
 ## v1 收尾状态（M0–M4 全部完成）
 
 计划中的 5 个里程碑已全部落地，`xx-code` 现在能：

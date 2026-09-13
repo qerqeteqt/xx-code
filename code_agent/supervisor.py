@@ -216,6 +216,8 @@ def _answer_to_user(llm, messages: list) -> list:
     anchor = getattr(messages[-1], "id", None) or uuid.uuid4().hex
     return [AIMessage(
         content=normalize_content(reply.content),
+        # 带上 token 用量，供 CLI 统计（重建消息时容易漏掉，别丢）
+        usage_metadata=getattr(reply, "usage_metadata", None),
         # id 必须**逐轮唯一**。曾用 `supervisor-answer-{attempts}`，而 attempts 每轮重置，
         # 于是第二轮的 id 与第一轮相同 → add_messages 按 id 去重，把新回答覆盖到旧位置，
         # CLI 取"最后一条 AI 消息"就拿到了旧回答（实测踩到），还会污染历史。

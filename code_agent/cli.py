@@ -117,11 +117,12 @@ def cmd_check(_args: argparse.Namespace) -> int:
     return 0
 
 
-def _print_update(node: str, update, seen: set | None = None) -> None:
-    """打印该节点**新产生**的工具调用。
+def _print_update(node: str, update, seen: set | None = None,
+                  stats: dict | None = None) -> None:
+    """打印该节点**新产生**的工具调用，并累加 token 用量。
 
     子图节点返回的状态里会带上它继承的整段共享历史，因此必须按消息 id 去重，
-    否则会把上一个 agent 的动作误标到当前节点名下。
+    否则会把上一个 agent 的动作误标到当前节点名下（顺带也会把用量重复计入）。
     """
     style = ROLE_STYLE.get(node, "white")
     for message in (update or {}).get("messages", []) or []:
@@ -131,12 +132,47 @@ def _print_update(node: str, update, seen: set | None = None) -> None:
                 continue
             if message_id is not None:
                 seen.add(message_id)
+        if stats is not None and isinstance(message, AIMessage):
+            usage = getattr(message, "usage_metadata", None) or {}
+            if usage:
+                stats["calls"] += 1
+                stats["in"] += int(usage.get("input_tokens") or 0)
+                stats["out"] += int(usage.get("output_tokens") or 0)
         for call in getattr(message, "tool_calls", None) or []:
             raw = json.dumps(call.get("args", {}), ensure_ascii=False)
             console.print(
                 f"[{style}]{node:<10}[/][dim]→[/] {call.get('name')}"
                 f"[dim]({escape(raw[:140])})[/]"
             )
+
+
+def _new_stats() -> dict:
+    return {"calls": 0, "in": 0, "out": 0}
+
+
+def _usage_totals(messages: list) -> dict:
+    """把一批消息里的 token 用量加总（只算带 usage_metadata 的 AIMessage）。"""
+    stats = _new_stats()
+    for message in messages:
+        if not isinstance(message, AIMessage):
+            continue
+        usage = getattr(message, "usage_metadata", None) or {}
+        if usage:
+            stats["calls"] += 1
+            stats["in"] += int(usage.get("input_tokens") or 0)
+            stats["out"] += int(usage.get("output_tokens") or 0)
+    return stats
+
+
+def _print_usage(stats: dict, title: str) -> None:
+    """打印一行用量统计。注意 output 里也包含 thinking 的 token，所以数字偏大属正常。"""
+    if not stats["calls"]:
+        return
+    total = stats["in"] + stats["out"]
+    console.print(
+        f"[dim]{title}：模型调用 {stats['calls']} 次 · "
+        f"输入 {stats['in']:,} · 输出 {stats['out']:,} · 合计 {total:,} tokens[/]"
+    )
 
 
 def _ask(interrupt_value) -> str:
@@ -170,57 +206,58 @@ def _final_answer(messages: list, since: int = 0) -> str:
     return "(本轮没有产生回答)"
 
 
-def _stream_once(graph, payload, config, seen: set, streamed: dict,
+def _stream_once(graph, payload, config, seen: set, turn: dict,
                  label: str | None = None):
     """跑一轮 stream；返回捕获到的 interrupt 值（没有则 None）。
 
     用 `["updates", "custom"]` 两种模式并用：
-    - `updates`：节点完成的增量（工具调用轨迹），**interrupt 只在这个模式里出现**
+    - `updates`：节点完成的增量（工具调用轨迹 + token 用量），
+      **interrupt 只在这个模式里出现**
     - `custom` ：supervisor 边生成边推出来的回答增量（逐字显示）
 
-    `streamed` 记录本轮是否已经在流式输出回答（用于决定要不要再渲染最终面板）。
+    `turn` 记录本轮状态：是否已流式输出过回答（started）+ token 用量（calls/in/out）。
     label 用于把节点名统一显示成角色名（--agent 模式下顶层是 worker 自身，
     节点名会是内部的 model/tools）。
     """
     for mode, chunk in graph.stream(payload, config, stream_mode=["updates", "custom"]):
         if mode == "custom":
-            _print_answer_delta(chunk, streamed)
+            _print_answer_delta(chunk, turn)
             continue
         if "__interrupt__" in chunk:
             return chunk["__interrupt__"][0].value
         for node, update in chunk.items():
-            _print_update(label or node, update, seen)
+            _print_update(label or node, update, seen, turn)
     return None
 
 
-def _print_answer_delta(chunk, streamed: dict) -> None:
+def _print_answer_delta(chunk, turn: dict) -> None:
     """打印回答的流式增量（supervisor 通过 get_stream_writer 推出来的）。"""
     if not (isinstance(chunk, dict) and chunk.get("type") == "answer_delta"):
         return
-    if not streamed.get("started"):
+    if not turn.get("started"):
         console.print()  # 与上面的工具轨迹隔开
-        streamed["started"] = True
+        turn["started"] = True
     console.print(chunk["text"], end="", markup=False, highlight=False)
 
 
 def _drive(graph, payload, config, label: str | None = None) -> dict:
-    """驱动图跑完，遇到危险命令就暂停询问，然后恢复。
+    """驱动图跑完，遇到危险命令就暂停询问，然后恢复，最后打印本轮 token 用量。
 
-    `seen` 跨 resume 保留，否则中断恢复后会把中断前的消息重复打印。
-    返回值里的 `started` 表示本轮回答是否已经流式输出过。
+    `seen` 跨 resume 保留，否则中断恢复后会把中断前的消息重复打印（用量也会重复计）。
     """
     from langgraph.types import Command
 
     seen: set = set()
-    streamed: dict = {}
+    turn: dict = {"started": False, **_new_stats()}
     while True:
-        pending = _stream_once(graph, payload, config, seen, streamed, label)
+        pending = _stream_once(graph, payload, config, seen, turn, label)
         if pending is None:
             break
         payload = Command(resume=_ask(pending))
-    if streamed.get("started"):
+    if turn.get("started"):
         console.print()  # 收尾换行
-    return streamed
+    _print_usage(turn, "本轮")
+    return turn
 
 
 def _check_pg(dsn: str | None) -> None:
@@ -381,6 +418,10 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 )
                 console.print(Panel(final, title="最终结论", border_style="green"))
 
+        # 仍在 checkpointer 上下文内，才能读状态
+        session = _usage_totals(graph.get_state(config).values.get("messages", []))
+
+    _print_usage(session, "本会话累计")
     console.print("\n[dim]会话已保存（内容在 PostgreSQL 里，退出不会丢）。下次继续：[/]")
     if Path.cwd() == Path(root.root):
         console.print("  [cyan]xx-code[/]  [dim]（当前目录就是该仓库，会自动续接本次会话）[/]")
