@@ -300,19 +300,18 @@ def cmd_chat(args: argparse.Namespace) -> int:
             repo_arg = "."
     root = RepoRoot(repo_arg)
 
-    thread_id = args.thread_id
-    resumed = False
-    if thread_id is None and not args.new:
-        thread_id = _load_last_session(str(root))
-        resumed = thread_id is not None
-    thread_id = thread_id or uuid.uuid4().hex
+    if args.thread_id:
+        thread_id, label = args.thread_id, "[dim]（指定会话）[/]"
+    else:
+        remembered = None if args.new else _load_last_session(str(root))
+        if remembered:
+            thread_id, label = remembered, "[green]（已续接上次会话）[/]"
+        else:
+            thread_id, label = uuid.uuid4().hex, "[dim]（新会话）[/]"
 
     _check_pg(settings.pg_dsn)
     console.print(f"[dim]仓库[/] {root}")
-    console.print(
-        f"[dim]会话[/] {thread_id}"
-        + ("  [green]（已续接上次会话）[/]" if resumed else "  [dim]（新会话）[/]")
-    )
+    console.print(f"[dim]会话[/] {thread_id}  {label}")
     console.print("[dim]直接输入任务即可；[/][cyan]:new[/][dim] 开新会话，[/][cyan]:q[/][dim] 退出[/]\n")
 
     with open_checkpointer(settings.pg_dsn) as checkpointer:
@@ -354,7 +353,9 @@ def cmd_chat(args: argparse.Namespace) -> int:
             )
             console.print(Panel(final, title="最终结论", border_style="green"))
 
-    console.print("[dim]会话结束。[/]")
+    console.print("\n[dim]会话已保存（内容在 PostgreSQL 里，退出不会丢）。下次继续：[/]")
+    console.print(f"  [cyan]python -m code_agent.cli --chat --repo {root}[/]")
+    console.print(f"  [dim]或指定会话：[/][cyan]--thread-id {thread_id}[/]")
     return 0
 
 
