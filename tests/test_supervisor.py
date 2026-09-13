@@ -9,7 +9,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.graph import END
 
 from code_agent.messages import text_of
-from code_agent.supervisor import make_supervisor, prune_scratchpad
+from code_agent.supervisor import _SYSTEM, make_supervisor, prune_scratchpad
 
 
 def _route(model, *contents: str, attempts: int = 0, extra: list | None = None,
@@ -161,6 +161,25 @@ def test_made_edits_is_recorded_even_though_scratchpad_is_pruned(scripted):
 
     assert cmd.update["made_edits"] is True
     assert "a1" in {getattr(m, "id", None) for m in cmd.update["messages"]}, "同一批里要把它剪掉"
+
+
+def test_capability_matrix_matches_worker_tools():
+    """回归：supervisor 的提示词必须与各 worker 的**真实能力**对得上。
+
+    踩过的坑：给 explorer 加上 `web_search` 之后，忘了更新 supervisor 的能力矩阵 →
+    它根本不知道"联网检索"这项能力存在，于是把"联网查天气"派给了 verifier，
+    而 verifier 只能用 `curl` 裸访网络 —— 绕过了有边界的检索工具。
+    （提示词里的能力说明一旦和 `workers.py` 脱节，就会重复踩这个坑。）
+    """
+    for role in ("explorer", "coder", "verifier"):
+        assert role in _SYSTEM, f"能力矩阵里要写明 {role}"
+
+    assert "web_search" in _SYSTEM, "必须写明 explorer 能联网检索"
+    assert "run_command" in _SYSTEM, "必须写明 verifier 能执行命令"
+
+    web_line = next(ln for ln in _SYSTEM.splitlines() if "web_search" in ln)
+    assert "explorer" in web_line, "要指明联网检索归 explorer"
+    assert "curl" in _SYSTEM, "要明确禁止用 run_command + curl 裸访网络"
 
 
 def test_digest_is_bounded(scripted):

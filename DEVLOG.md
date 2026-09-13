@@ -1011,6 +1011,59 @@ xx-code --history
 
 ---
 
+## 修复 — 联网任务被误派、且绕过了 web_search（2026-09-13）
+
+### 现象（用户实测）
+
+用户说「联网搜索一下今天的天气」，实际发生的是：supervisor 把任务派给了 **verifier**，
+verifier 用 **`curl` 裸访网络** —— 我们接的 `web_search`（Tavily）**一次都没用上**。
+用户自己看出来了并提问，这个 bug 才被发现。
+
+### 根因
+
+**supervisor 的提示词里完全没提"联网检索"这项能力**（`grep web_search supervisor.py` 零命中）。
+M4 给 explorer 加上 `web_search` 时，只改了 **explorer 自己的**提示词，
+**忘了同步 supervisor 的能力矩阵**。
+
+于是 supervisor 只从能力表里知道"谁能执行命令"，就把"联网"理解成"跑命令"→ 派 verifier。
+而 verifier 没有 `web_search`，只能用 `run_command` + `curl` 硬凑。
+
+**两个后果**：
+1. **有边界的工具被绕过**：Tavily 只查一个来源、返回已抽取的摘要；`curl` 能访问**任意 URL**。
+2. **角色漂移**：verifier 本该做核验，变成了网络抓取器。
+
+### 修复
+
+1. 能力矩阵补上：`explorer：… + **能联网检索（web_search）**`
+2. 明确派活规则：`需要「查外部资料 / 联网检索」→ explorer`，并写明
+   **不要**为了联网把任务派给 verifier 用 curl 裸访网络。
+
+### 验证（重跑同一个请求）
+
+```
+[supervisor] 下一步 → explorer（需要联网检索今天重庆的天气，只有 explorer 具备 web_search 能力）
+explorer  → web_search({"query": "今天重庆天气 实时气温 天气预报"})
+explorer  → web_search(...)          ← 用的是有边界的 Tavily，不再是 curl
+[supervisor] 下一步 → finish
+```
+
+`pytest` → **118 passed, 1 skipped**（新增能力矩阵的契约测试）。
+
+### 备注与坑
+
+1. **教训：提示词里的"能力矩阵"必须与 `workers.py` 的真实工具同步。**
+   加/换工具时漏改提示词，supervisor 就会按**过时的能力表**派活 —— 不报错，
+   只是悄悄绕路。→ 补了契约测试 `test_capability_matrix_matches_worker_tools`：
+   断言提示词里写明了各角色的关键工具（`web_search` / `run_command`）与其归属。
+2. **这类问题只有"用自然语言提真实请求"才会暴露。** 当初验证 `web_search` 时，
+   我是**显式命令** explorer 去用它 —— 只验证了"工具能用"，
+   从没验证"supervisor 会不会把联网请求路由过去"。
+   又一个"必须在真实场景里用"的例子。
+3. 顺带明确一个边界：**查天气这类通用问答本来就不在我们 agent 的设计范围**（它是代码 agent）。
+   修好之后它至少会走**设计中的那条路**（explorer + 有边界的检索工具），而不是靠 curl 硬凑。
+
+---
+
 ## v1 收尾状态（M0–M4 全部完成）
 
 计划中的 5 个里程碑已全部落地，`xx-code` 现在能：
