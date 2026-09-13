@@ -294,8 +294,8 @@ def _drive(graph, payload, config, label: str | None = None) -> dict:
     return turn
 
 
-def _list_sessions(graph, root: str) -> None:
-    """列出会话（直接读 `.code_agent_sessions/*.jsonl`）。"""
+def _list_sessions(checkpointer, graph, root: str) -> None:
+    """列出会话（文件名本身就是可读的：日期目录 / 时间-摘要-短id）。"""
     index: dict[str, str] = {}
     try:
         raw = json.loads(_session_path().read_text(encoding="utf-8"))
@@ -303,34 +303,29 @@ def _list_sessions(graph, root: str) -> None:
     except (OSError, json.JSONDecodeError):
         pass
 
-    files = sorted(SESSION_DIR.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    sessions = checkpointer.sessions()
     console.print(f"[dim]仓库[/] {root}")
-    if not files:
+    if not sessions:
         console.print("\n[dim]还没有任何会话。跑一次 `xx-code` 就会生成。[/]")
         return
 
-    console.print(f"\n[bold]会话（{len(files)} 个，按最近使用排序）[/]")
-    for path in files[:15]:
-        thread_id = path.stem
+    console.print(f"\n[bold]会话（{len(sessions)} 个，按最近使用排序）[/]")
+    for thread_id, path in sessions[:15]:
         try:
             msgs = graph.get_state(
                 {"configurable": {"thread_id": thread_id}}
             ).values.get("messages", [])
         except Exception:  # noqa: BLE001 - 单个会话读不出来不该影响整个列表
             msgs = []
-        first = next(
-            (text_of(m) for m in msgs
-             if type(m).__name__ == "HumanMessage"
-             and not text_of(m).startswith("[Supervisor")),
-            "(空)",
-        )
+        relative = path.relative_to(SESSION_DIR).as_posix()
         repo = index.get(thread_id, "(未标记)")
-        console.print(f"  [cyan]{thread_id}[/]  [dim]{len(msgs)} 条消息[/]")
-        console.print(f"      [dim]{first[:56]}  ·  {repo}[/]")
+        console.print(f"  [cyan]{relative}[/]")
+        console.print(f"      [dim]{len(msgs)} 条消息 · {repo} · id={thread_id[:8]}[/]")
 
     console.print(
         "\n[dim]看某一条的完整记录（含被剪掉的工具调用与结果）：[/]\n"
-        f"  [cyan]xx-code --history --thread-id <上面的 id>[/]"
+        "  [cyan]xx-code --history --thread-id <id，粘贴前几位即可>[/]\n"
+        f"[dim]文件也可以直接用编辑器打开：[/][cyan]{SESSION_DIR}[/]"
     )
 
 
@@ -345,7 +340,7 @@ def _print_transcript(graph, thread_id: str) -> None:
     console.print(
         f"[dim]会话[/] {thread_id}\n"
         f"[dim]{len(states)} 个快照，合并后 {len(merged)} 条消息；"
-        f"标 [yellow]·已剪[/] 的表示当前不在模型上下文里（记录本身仍在库里）[/]\n"
+        f"标 [yellow]·已剪[/] 的表示当前不在模型上下文里（记录本身仍在文件里）[/]\n"
     )
     for message in merged:
         kind = type(message).__name__
@@ -362,6 +357,21 @@ def _print_transcript(graph, thread_id: str) -> None:
             console.print(f"[dim]             → 调用 {calls}[/]")
 
 
+def _resolve_thread(checkpointer, prefix: str) -> str | None:
+    """把（可能是前缀的）id 解析成完整 thread_id —— 列表里只显示前 8 位，方便粘贴。"""
+    ids = [thread_id for thread_id, _ in checkpointer.sessions()]
+    if prefix in ids:
+        return prefix
+    hits = [thread_id for thread_id in ids if thread_id.startswith(prefix)]
+    if len(hits) == 1:
+        return hits[0]
+    console.print(
+        f"[red]id 不唯一或不存在：[/]{prefix}"
+        + (f"（匹配到 {len(hits)} 个）" if hits else "")
+    )
+    return None
+
+
 def cmd_history(args: argparse.Namespace) -> int:
     """查看历史记录：不带 --thread-id 列会话，带了则打印完整记录。"""
     from code_agent.config import Settings
@@ -374,9 +384,12 @@ def cmd_history(args: argparse.Namespace) -> int:
     with open_checkpointer() as checkpointer:
         graph = build_graph(root, settings, checkpointer)
         if args.thread_id:
-            _print_transcript(graph, args.thread_id)
+            thread_id = _resolve_thread(checkpointer, args.thread_id)
+            if thread_id is None:
+                return 1
+            _print_transcript(graph, thread_id)
         else:
-            _list_sessions(graph, str(root))
+            _list_sessions(checkpointer, graph, str(root))
     return 0
 
 
@@ -396,6 +409,9 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     with open_checkpointer() as checkpointer:
         graph = build_graph(root, settings, checkpointer)
+        # 文件名里用第一句任务作摘要（只在会话首次落盘时生效）
+        checkpointer.set_label(thread_id, args.task)
+        _save_last_session(str(root), thread_id)  # 一次性任务也能被 --history 标上仓库、被下次续聊
         config = _config(thread_id, str(root))
         base = {m.id for m in graph.get_state(config).values.get("messages", [])}
         streamed = _drive(
@@ -498,6 +514,10 @@ def cmd_chat(args: argparse.Namespace) -> int:
 
             config = _config(thread_id, str(root))
             payload = {"messages": [HumanMessage(line)], "attempts": 0, "made_edits": False}
+
+            # 会话第一次落盘时，用第一句任务给文件起个可读的摘要名
+            if not checkpointer.has_session(thread_id):
+                checkpointer.set_label(thread_id, line)
 
             base = {m.id for m in graph.get_state(config).values.get("messages", [])}
             try:

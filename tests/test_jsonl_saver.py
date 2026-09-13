@@ -44,17 +44,40 @@ def test_state_survives_new_instance(tmp_path):
 
 def test_writes_to_disk_are_readable_jsonl(tmp_path):
     cfg = {"configurable": {"thread_id": "t2"}}
-    _build(JsonlSaver(tmp_path), tmp_path).invoke(
+    saver = JsonlSaver(tmp_path)
+    saver.set_label("t2", "修复 calc 加法")
+    _build(saver, tmp_path).invoke(
         {"messages": [HumanMessage("开始")], "attempts": 0, "made_edits": False}, cfg
     )
 
-    path = tmp_path / "t2.jsonl"
-    assert path.exists(), "应该生成 <thread_id>.jsonl"
+    path = saver.path_for("t2")
+    assert path is not None and path.exists(), "应该落盘"
     lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
     assert lines, "文件不该为空"
+
     import json
 
-    assert {json.loads(ln)["op"] for ln in lines} <= {"put", "writes"}
+    records = [json.loads(ln) for ln in lines]
+    assert {r["op"] for r in records} <= {"put", "writes"}
+    assert records[0]["meta"]["t"] == "t2", "第一行要带 meta（真正的 thread_id）"
+
+
+def test_file_name_is_readable_and_under_date_folder(tmp_path):
+    """文件名要一眼能看懂：2026/09/13/143022-修复-calc-加法-t2abcd.jsonl"""
+    from datetime import datetime
+
+    saver = JsonlSaver(tmp_path)
+    saver.set_label("t2abcd9999", "修复 calc 加法")
+    _build(saver, tmp_path).invoke(
+        {"messages": [HumanMessage("开始")], "attempts": 0, "made_edits": False},
+        {"configurable": {"thread_id": "t2abcd9999"}},
+    )
+
+    relative = saver.path_for("t2abcd9999").relative_to(tmp_path).as_posix()
+    now = datetime.now()
+    assert relative.startswith(f"{now:%Y}/{now:%m}/{now:%d}/"), f"应按日期分目录，实际: {relative}"
+    assert "修复-calc-加法" in relative, f"文件名要含任务摘要，实际: {relative}"
+    assert "t2abcd" in relative, f"文件名要含短 id 防重名，实际: {relative}"
 
 
 def test_threads_are_isolated(tmp_path):
@@ -95,7 +118,9 @@ def test_concurrent_appends_do_not_corrupt(tmp_path):
     for thread in threads:
         thread.join()
 
-    lines = [ln for ln in (tmp_path / "t.jsonl").read_text(encoding="utf-8").splitlines() if ln.strip()]
+    lines = [
+        ln for ln in saver.path_for("t").read_text(encoding="utf-8").splitlines() if ln.strip()
+    ]
     assert len(lines) == 24, "每行应该是一次完整的追加"
     for line in lines:
         json.loads(line)  # 任何一行残缺都会在这里炸
@@ -104,12 +129,12 @@ def test_concurrent_appends_do_not_corrupt(tmp_path):
 def test_corrupt_line_is_skipped(tmp_path):
     """进程被杀时最后一行可能只写了一半 —— 不该让整个会话报废。"""
     cfg = {"configurable": {"thread_id": "t3"}}
-    _build(JsonlSaver(tmp_path), tmp_path).invoke(
+    saver = JsonlSaver(tmp_path)
+    _build(saver, tmp_path).invoke(
         {"messages": [HumanMessage("开始")], "attempts": 0, "made_edits": False}, cfg
     )
 
-    path = tmp_path / "t3.jsonl"
-    with path.open("a", encoding="utf-8") as handle:
+    with saver.path_for("t3").open("a", encoding="utf-8") as handle:
         handle.write('{"op": "put", "cp": [')  # 半行
 
     reopened = _build(JsonlSaver(tmp_path), tmp_path)
