@@ -901,6 +901,63 @@ ToolMessage   ·已剪 # calc.py (共 8 行) 1  def add(a, b): …      ← 连�
 
 ---
 
+## 存储迁移 — 从 PostgreSQL 换成本地 JSONL（2026-09-13）
+
+### 目标
+
+用户要求彻底去掉 PostgreSQL，改用本地文件（像 Claude Code 那样），后续长期记忆也用
+Markdown 文档存。这里是第一步：**短期记忆（图状态）落成本地 JSONL**。
+
+### 关键设计决定
+
+**子类化 `InMemorySaver`，只加"落盘/重放"一层**，而不是从零实现 `BaseCheckpointSaver`
+（参考：InMemorySaver 603 行、PostgresSaver 476 行，四个方法都不平凡）。
+理由：`put_writes` 一旦写错，**HITL 的暂停/恢复会静默失效**（平时能跑、一到危险命令
+要确认就出问题）。只在经过验证的实现之上加持久化，风险最低。
+
+实现上有个省事的发现：`InMemorySaver` 的三个容器（`storage` / `writes` / `blobs`）
+**存的已经是 `JsonPlusSerializer` 序列化后的 `(type, bytes)`** —— 所以只要把这些
+tuple 用 base64 转成文本写进 JSONL，重放时再解回来即可，不需要自己设计序列化。
+
+| 文件 | 说明 |
+|---|---|
+| `code_agent/jsonl_saver.py` | **新增**：`JsonlSaver(InMemorySaver)` + 落盘/重放 + 追加锁 |
+| `code_agent/graph.py` | `open_checkpointer()` 改返回 `JsonlSaver`（不再要 DSN） |
+| `code_agent/config.py` | 新增 `SESSION_DIR`；`Settings` 去掉 `pg_dsn` |
+| `code_agent/cli.py` | 删掉 `_check_pg` 与所有 psycopg 用法；`--history` 改为读本地文件 |
+| `.env.example` / `requirements.txt` / `.gitignore` | 去掉数据库相关条目 |
+
+文件布局（`<项目根>/.code_agent_sessions/`）：
+
+```
+<thread_id>.jsonl   一行一条操作：{"op":"put",...} / {"op":"writes",...}，append-only
+index.json          哪个仓库用哪个会话（原 .code_agent_sessions.json）
+```
+
+### 验证
+
+- `pytest` → **116 passed, 1 skipped**（新增 `tests/test_jsonl_saver.py` 6 例）
+- 端到端实测：`--check` 不需要数据库；跑任务正常修复 bug；
+  **换进程续聊仍能凭记忆回答**（跨进程 = 原 PG 提供的保证，用文件后依然成立）
+- 新增的关键回归：**跨实例恢复 interrupt**（`test_interrupt_and_resume_across_instances`）
+  —— 这是 HITL 的命根子，换存储最容易弄坏的就是它
+
+### 备注与坑
+
+1. **⚠️ 追加必须加锁 —— 实测踩到。** LangGraph 的并行任务会**多线程**调用 `put_writes`
+   （工具并行执行我们早先已实测过），不加锁时两次写入交错，把行切成半截：
+   文件里出现"**行首是 base64 碎片、行尾才是完整 JSON**"的坏行，重放时被当成损坏行大量跳过。
+   → 加 `threading.Lock`，整行（含换行）一次性写入；并补了并发追加的回归测试。
+   （有意思的是：那次会话**仍然能正常恢复** —— 因为关键的 `put` 记录侥幸完好，
+   坏行只是被跳过。所以这个 bug 很隐蔽，只有去数坏行才发现。）
+2. 老会话（存在 PostgreSQL `langgraph_db` 里的）**不会自动迁过来**，`--history` 也列不到了。
+   数据还在那个库里，需要的话可以写个一次性导入脚本。
+3. `.env` 里残留的 `AGENT_PG_DSN` 已无人读取（无害），可以自行删掉。
+4. `langgraph-checkpoint-postgres` / `psycopg` 已从 `requirements.txt` 移除，
+   但环境里仍装着 —— 想彻底清理可 `pip uninstall langgraph-checkpoint-postgres psycopg psycopg-pool`。
+
+---
+
 ## v1 收尾状态（M0–M4 全部完成）
 
 计划中的 5 个里程碑已全部落地，`xx-code` 现在能：

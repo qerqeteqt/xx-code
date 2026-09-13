@@ -15,6 +15,11 @@ from dotenv import load_dotenv
 # 项目根目录（本文件位于 <root>/code_agent/config.py）
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+# 会话状态与记录的存放目录（本地文件，不再依赖数据库）
+# - <thread_id>.jsonl : 图状态（短期记忆 / HITL 续跑）
+# - index.json        : 哪个仓库用哪个会话
+SESSION_DIR = PROJECT_ROOT / ".code_agent_sessions"
+
 
 class ConfigError(RuntimeError):
     """配置缺失或不合法。"""
@@ -35,7 +40,6 @@ class Settings:
     base_url: str
     auth_token: str
     model: str
-    pg_dsn: str | None
     tavily_api_key: str | None
 
     @classmethod
@@ -53,7 +57,6 @@ class Settings:
             base_url=os.environ["AGENT_BASE_URL"],
             auth_token=os.environ["AGENT_AUTH_TOKEN"],
             model=os.environ["AGENT_MODEL"],
-            pg_dsn=os.getenv("AGENT_PG_DSN") or None,
             tavily_api_key=os.getenv("TAVILY_API_KEY") or None,
         )
 

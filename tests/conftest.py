@@ -40,6 +40,5 @@ def fake_settings() -> Settings:
         base_url="http://example.invalid",
         auth_token="fake-token",
         model="fake-model",
-        pg_dsn=None,
         tavily_api_key=None,
     )

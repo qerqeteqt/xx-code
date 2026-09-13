@@ -19,7 +19,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 
-from code_agent.config import PROJECT_ROOT
+from code_agent.config import SESSION_DIR
 from code_agent.messages import text_of
 
 AGENT_ROLES = ("explorer", "coder", "verifier")
@@ -37,13 +37,10 @@ ROLE_STYLE = {
 
 console = Console(highlight=False)
 
-# 记录"每个仓库最近一次的会话 id"，让 --chat 下次能自动续接上（短期记忆的一部分）。
-# 放在项目根、已被 .gitignore 排除，不会进版本库。
-SESSION_FILE = ".code_agent_sessions.json"
-
-
+# 记录"每个仓库最近一次的会话 id"，让 --chat 下次能自动续接上。
+# 与会话内容放在同一个目录（.code_agent_sessions/），已被 .gitignore 排除。
 def _session_path() -> Path:
-    return PROJECT_ROOT / SESSION_FILE
+    return SESSION_DIR / "index.json"
 
 
 def _load_last_session(repo: str) -> str | None:
@@ -56,6 +53,7 @@ def _load_last_session(repo: str) -> str | None:
 
 def _save_last_session(repo: str, thread_id: str) -> None:
     path = _session_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -296,56 +294,29 @@ def _drive(graph, payload, config, label: str | None = None) -> dict:
     return turn
 
 
-def _check_pg(dsn: str | None) -> None:
-    """提前验证 PostgreSQL 可连。
-
-    否则连接失败时用户会看到一长串 psycopg 堆栈（其中 PG 返回的中文报错还可能因
-    控制台编码问题变成乱码）。这里转成一句人话。
-    """
-    if not dsn:
-        raise RuntimeError("缺少 AGENT_PG_DSN，请参考 .env.example 配置后再运行。")
-
-    import psycopg
-
-    try:
-        with psycopg.connect(dsn, connect_timeout=5):
-            return
-    except Exception as exc:  # noqa: BLE001 - 统一转成友好提示
-        raise RuntimeError(
-            "无法连接 PostgreSQL。请确认：\n"
-            "  1) 服务已启动（Get-Service *postgres*）\n"
-            "  2) .env 里的 AGENT_PG_DSN 用户名/密码/库名正确\n"
-            "  3) 数据库 langgraph_db 存在\n"
-            f"  （底层错误类型：{type(exc).__name__}）"
-        ) from exc
-
-
 def _list_sessions(graph, root: str) -> None:
-    """列出会话（按仓库筛）。没编号，用完整 thread_id 指定要看哪个。"""
-    import psycopg
+    """列出会话（直接读 `.code_agent_sessions/*.jsonl`）。"""
+    index: dict[str, str] = {}
+    try:
+        raw = json.loads(_session_path().read_text(encoding="utf-8"))
+        index = {thread_id: repo for repo, thread_id in raw.items()}
+    except (OSError, json.JSONDecodeError):
+        pass
 
-    from code_agent.config import Settings
-
-    with psycopg.connect(Settings.from_env().pg_dsn) as conn, conn.cursor() as cur:
-        cur.execute(
-            """select thread_id, max(metadata->>'repo') as repo, count(*)
-               from checkpoints group by thread_id order by max(checkpoint_id) desc"""
-        )
-        rows = cur.fetchall()
-
-    mine = [r for r in rows if r[1] == root]
-    others = [r for r in rows if r[1] != root]
+    files = sorted(SESSION_DIR.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
     console.print(f"[dim]仓库[/] {root}")
+    if not files:
+        console.print("\n[dim]还没有任何会话。跑一次 `xx-code` 就会生成。[/]")
+        return
 
-    if mine:
-        console.print(f"\n[bold]本仓库的会话（{len(mine)} 个）[/]")
-    else:
-        console.print("\n[dim]本仓库暂无已标记的会话（旧会话没记仓库信息，见下面的「其它」）[/]")
-
-    for tid, _repo, n in mine + others[:8]:
+    console.print(f"\n[bold]会话（{len(files)} 个，按最近使用排序）[/]")
+    for path in files[:15]:
+        thread_id = path.stem
         try:
-            msgs = graph.get_state({"configurable": {"thread_id": tid}}).values.get("messages", [])
-        except Exception:  # noqa: BLE001 - 单个会话读不出来不该影响列表
+            msgs = graph.get_state(
+                {"configurable": {"thread_id": thread_id}}
+            ).values.get("messages", [])
+        except Exception:  # noqa: BLE001 - 单个会话读不出来不该影响整个列表
             msgs = []
         first = next(
             (text_of(m) for m in msgs
@@ -353,9 +324,9 @@ def _list_sessions(graph, root: str) -> None:
              and not text_of(m).startswith("[Supervisor")),
             "(空)",
         )
-        tag = "" if (tid, _repo, n) in mine else "[dim]其它仓库/未标记[/] "
-        console.print(f"  {tag}[cyan]{tid}[/]  [dim]{len(msgs)} 条消息[/]")
-        console.print(f"      [dim]{first[:60]}[/]")
+        repo = index.get(thread_id, "(未标记)")
+        console.print(f"  [cyan]{thread_id}[/]  [dim]{len(msgs)} 条消息[/]")
+        console.print(f"      [dim]{first[:56]}  ·  {repo}[/]")
 
     console.print(
         "\n[dim]看某一条的完整记录（含被剪掉的工具调用与结果）：[/]\n"
@@ -399,9 +370,8 @@ def cmd_history(args: argparse.Namespace) -> int:
 
     settings = Settings.from_env()
     root = RepoRoot(args.repo or ".")
-    _check_pg(settings.pg_dsn)
 
-    with open_checkpointer(settings.pg_dsn) as checkpointer:
+    with open_checkpointer() as checkpointer:
         graph = build_graph(root, settings, checkpointer)
         if args.thread_id:
             _print_transcript(graph, args.thread_id)
@@ -411,7 +381,7 @@ def cmd_history(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """完整模式：supervisor 调度三个 worker，PostgreSQL 持久化。"""
+    """完整模式：supervisor 调度三个 worker，会话存本地 JSONL。"""
     from langchain_core.messages import HumanMessage
 
     from code_agent.config import Settings
@@ -424,8 +394,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     console.print(f"[dim]仓库[/] {root}\n[dim]会话[/] {thread_id}\n[dim]任务[/] {args.task}")
 
-    _check_pg(settings.pg_dsn)
-    with open_checkpointer(settings.pg_dsn) as checkpointer:
+    with open_checkpointer() as checkpointer:
         graph = build_graph(root, settings, checkpointer)
         config = _config(thread_id, str(root))
         base = {m.id for m in graph.get_state(config).values.get("messages", [])}
@@ -501,12 +470,11 @@ def cmd_chat(args: argparse.Namespace) -> int:
         else:
             thread_id, label = uuid.uuid4().hex, "[dim]（新会话）[/]"
 
-    _check_pg(settings.pg_dsn)
     console.print(f"[dim]仓库[/] {root}")
     console.print(f"[dim]会话[/] {thread_id}  {label}")
     console.print("[dim]直接输入任务即可；[/][cyan]:new[/][dim] 开新会话，[/][cyan]:q[/][dim] 退出[/]\n")
 
-    with open_checkpointer(settings.pg_dsn) as checkpointer:
+    with open_checkpointer() as checkpointer:
         graph = build_graph(root, settings, checkpointer)
         _save_last_session(str(root), thread_id)
         # 进程内累加，而不是回头读库求和 —— 方案 B 会剪掉带用量的消息，读库会少算
@@ -549,7 +517,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 console.print(Panel(final, title="最终结论", border_style="green"))
 
     _print_usage(session, "本次运行累计")
-    console.print("\n[dim]会话已保存（内容在 PostgreSQL 里，退出不会丢）。下次继续：[/]")
+    console.print(f"\n[dim]会话已保存到 {SESSION_DIR}（退出不会丢）。下次继续：[/]")
     if Path.cwd() == Path(root.root):
         console.print("  [cyan]xx-code[/]  [dim]（当前目录就是该仓库，会自动续接本次会话）[/]")
     else:

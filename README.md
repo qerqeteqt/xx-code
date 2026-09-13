@@ -8,18 +8,21 @@ Supervisor 调度三个 Agent —— **Explorer**（定位代码）/ **Coder**�
 
 ## 状态
 
-可多轮对话（短期记忆）、回答流式输出、会话持久化在 PostgreSQL、支持联网检索。
-**108 passed, 1 skipped** —— 含 supervisor 路由 / 图接线 / HITL / 并发编辑 / 剪枝的回归测试。
+可多轮对话（短期记忆）、回答流式输出、会话存**本地 JSONL 文件**（不需要数据库）、支持联网检索。
+**116 passed, 1 skipped** —— 含 supervisor 路由 / 图接线 / HITL / 并发 / 剪枝 / JSONL 持久化的回归测试。
 
 编排已升级到**方案 B**：共享黑板里**只保留人话**（任务 / 指令 / 各成员汇报），
 worker 内部的工具调用与结果会在 supervisor 下一轮开始时被剪掉（`supervisor.prune_scratchpad`）。
 实测同任务的持久化状态从 44 条消息（含 24 条工具消息）降到 **8 条消息、0 条工具消息**。
 剩余待办见 [DEVLOG.md](DEVLOG.md) 末尾的「v1 收尾状态」。
 
+**待做：长期记忆** —— 用 Markdown 文档存储与检索（仿 Claude Code 的 `memory/` 方案），
+与现在的短期记忆（JSONL 会话状态）分开。
+
 ## 环境
 
 - Python **3.13**（conda env `langgraph`）
-- **PostgreSQL**（会话持久化 = "短期记忆"的本体）
+- 不需要数据库 —— 会话状态与记录都存本地文件
 - **DeepSeek API**（Anthropic 兼容端点）
 
 ## 开始
@@ -71,8 +74,8 @@ xx-code --history                          # 查看历史：列出会话
 xx-code --history --thread-id <id>         # 查看某次会话的完整记录（含被剪掉的工具调用与结果）
 ```
 
-记录存在本机 PostgreSQL（`langgraph_db`，连接串在 `.env`）。**别想着直接查表** ——
-消息是 msgpack 二进制，SQL 出来是乱码；用 `--history` 看。
+记录存在 `<项目根>/.code_agent_sessions/<thread_id>.jsonl`（**可以直接用编辑器打开看**）。
+一步一行、append-only；`--history` 会把被剪掉的工具调用也一并还原出来。
 
 找不到 `xx-code` 就说明没激活环境（先 `conda activate langgraph`），
 或用等价的 `python -m code_agent.cli`。
@@ -92,7 +95,8 @@ xx-code --history --thread-id <id>         # 查看某次会话的完整记录�
 ```
 code_agent/
 ├── cli.py         # 入口：交互模式 / 流式输出 / HITL 确认
-├── graph.py       # 组装 StateGraph + PostgreSQL checkpointer
+├── graph.py       # 组装 StateGraph
+├── jsonl_saver.py # 会话持久化（本地 JSONL，替代数据库）
 ├── supervisor.py  # 中心调度（JSON 路由 + 指令注入 + 生成回答）
 ├── workers.py     # Explorer / Coder / Verifier 三个子图（最小权限）
 ├── state.py       # 父图共享 State
@@ -112,6 +116,7 @@ tests/             # 105 passed
 - **上下文压缩**：工具内源头截断 → 剪掉旧草稿 → supervisor 只看摘要（带长度上限）。
 - **工具失败**：工具内部捕获并回传错误给模型，但必须放行 `GraphBubbleUp`（否则 `interrupt` 失效）。
 - **并发**：同一轮多个工具调用会**并行执行**，因此文件读-改-写必须串行化。
-- **持久化**：`PostgresSaver` + `thread_id`；会话跨进程续跑，这就是"短期记忆"。
+- **持久化**：本地 JSONL（`jsonl_saver.py`）+ `thread_id`；跨进程续跑 = "短期记忆"。
+  追加要**加锁** —— 并行任务会多线程写，不加锁会把行切成半截（实测踩到）。
 
 踩坑记录（思考模型的种种约束、Windows 编码、丢失更新等）见 [DEVLOG.md](DEVLOG.md)。

@@ -41,8 +41,8 @@ Desktop.ini
 # ---- LangGraph local artifacts ----
 .langgraph_api/
 
-# ---- 交互模式（--chat）记录"每个仓库最近一次会话" ----
-.code_agent_sessions.json
+# ---- 会话状态与记录（本地 JSONL，替代数据库）----
+.code_agent_sessions/
 
 # ---- 打包产物 ----
 *.egg-info/

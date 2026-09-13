@@ -11,7 +11,6 @@ def _settings(tavily_key: str | None) -> Settings:
         base_url="http://example.invalid",
         auth_token="fake",
         model="fake",
-        pg_dsn=None,
         tavily_api_key=tavily_key,
     )
 

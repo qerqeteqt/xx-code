@@ -13,12 +13,10 @@ HITL 的 `interrupt()` 从子图内传播到根图，因此暂停/恢复都由�
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-
-from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import END, START, StateGraph
 
 from code_agent.config import Settings, build_llm
+from code_agent.jsonl_saver import open_jsonl_checkpointer
 from code_agent.paths import RepoRoot
 from code_agent.state import OverallState
 from code_agent.supervisor import make_supervisor
@@ -31,19 +29,13 @@ BUILDERS = {
 }
 
 
-@contextmanager
-def open_checkpointer(dsn: str | None):
-    """PostgreSQL checkpointer。
+def open_checkpointer(base_dir=None):
+    """打开 checkpointer（JSONL 本地文件，不依赖数据库）。
 
-    `setup()` 会建表（幂等），首次在别的机器上跑时也能自动初始化。
+    可直接当上下文管理器：`with open_checkpointer() as checkpointer:`。
+    会话存到 `<项目根>/.code_agent_sessions/<thread_id>.jsonl`。
     """
-    if not dsn:
-        raise RuntimeError(
-            "缺少 AGENT_PG_DSN，无法启用持久化。请参考 .env.example 配置。"
-        )
-    with PostgresSaver.from_conn_string(dsn) as saver:
-        saver.setup()
-        yield saver
+    return open_jsonl_checkpointer(base_dir)
 
 
 def build_graph(root: RepoRoot, settings: Settings, checkpointer):
