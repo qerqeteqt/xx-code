@@ -150,6 +150,42 @@ def _new_stats() -> dict:
     return {"calls": 0, "in": 0, "out": 0}
 
 
+def _config(thread_id: str, repo: str | None = None) -> dict:
+    """构造运行配置。带上 repo 元信息，`--history` 才能按仓库筛会话。"""
+    config: dict = {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": RECURSION_LIMIT,
+    }
+    if repo:
+        config["metadata"] = {"repo": repo}
+    return config
+
+
+def merge_history(states: list) -> tuple[list, set]:
+    """把多个历史快照合并成一份**完整**记录（含已被剪掉的消息）。
+
+    LangGraph 每走一步存一个快照，所以被剪掉的消息仍留在更早的快照里。
+    这里从最旧的快照往前扫、按消息 id 去重，得到按时间顺序的完整记录。
+
+    返回 (完整消息列表, 最新状态里仍存在的 id 集合) —— 后者用来标注哪些"已不在上下文里"。
+    """
+    latest_ids = set()
+    if states:
+        for message in states[0].values.get("messages", []) or []:
+            latest_ids.add(getattr(message, "id", None) or id(message))
+
+    merged: list = []
+    seen: set = set()
+    for state in reversed(states):  # states 是"从新到旧"，反过来即从最早开始
+        for message in state.values.get("messages", []) or []:
+            key = getattr(message, "id", None) or id(message)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(message)
+    return merged, latest_ids
+
+
 def _print_usage(stats: dict, title: str) -> None:
     """打印一行用量统计。注意 output 里也包含 thinking 的 token，所以数字偏大属正常。"""
     if not stats["calls"]:
@@ -284,6 +320,96 @@ def _check_pg(dsn: str | None) -> None:
         ) from exc
 
 
+def _list_sessions(graph, root: str) -> None:
+    """列出会话（按仓库筛）。没编号，用完整 thread_id 指定要看哪个。"""
+    import psycopg
+
+    from code_agent.config import Settings
+
+    with psycopg.connect(Settings.from_env().pg_dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            """select thread_id, max(metadata->>'repo') as repo, count(*)
+               from checkpoints group by thread_id order by max(checkpoint_id) desc"""
+        )
+        rows = cur.fetchall()
+
+    mine = [r for r in rows if r[1] == root]
+    others = [r for r in rows if r[1] != root]
+    console.print(f"[dim]仓库[/] {root}")
+
+    if mine:
+        console.print(f"\n[bold]本仓库的会话（{len(mine)} 个）[/]")
+    else:
+        console.print("\n[dim]本仓库暂无已标记的会话（旧会话没记仓库信息，见下面的「其它」）[/]")
+
+    for tid, _repo, n in mine + others[:8]:
+        try:
+            msgs = graph.get_state({"configurable": {"thread_id": tid}}).values.get("messages", [])
+        except Exception:  # noqa: BLE001 - 单个会话读不出来不该影响列表
+            msgs = []
+        first = next(
+            (text_of(m) for m in msgs
+             if type(m).__name__ == "HumanMessage"
+             and not text_of(m).startswith("[Supervisor")),
+            "(空)",
+        )
+        tag = "" if (tid, _repo, n) in mine else "[dim]其它仓库/未标记[/] "
+        console.print(f"  {tag}[cyan]{tid}[/]  [dim]{len(msgs)} 条消息[/]")
+        console.print(f"      [dim]{first[:60]}[/]")
+
+    console.print(
+        "\n[dim]看某一条的完整记录（含被剪掉的工具调用与结果）：[/]\n"
+        f"  [cyan]xx-code --history --thread-id <上面的 id>[/]"
+    )
+
+
+def _print_transcript(graph, thread_id: str) -> None:
+    """打印某个会话的完整记录，并标出哪些消息已不在（模型）上下文里。"""
+    states = list(graph.get_state_history({"configurable": {"thread_id": thread_id}}))
+    if not states:
+        console.print(f"[red]找不到会话：[/]{thread_id}")
+        return
+
+    merged, latest_ids = merge_history(states)
+    console.print(
+        f"[dim]会话[/] {thread_id}\n"
+        f"[dim]{len(states)} 个快照，合并后 {len(merged)} 条消息；"
+        f"标 [yellow]·已剪[/] 的表示当前不在模型上下文里（记录本身仍在库里）[/]\n"
+    )
+    for message in merged:
+        kind = type(message).__name__
+        style = {
+            "HumanMessage": "cyan",
+            "AIMessage": "white",
+            "ToolMessage": "dim",
+        }.get(kind, "white")
+        pruned = "" if (getattr(message, "id", None) or id(message)) in latest_ids else "  [yellow]·已剪[/]"
+        calls = [c["name"] for c in (getattr(message, "tool_calls", None) or [])]
+        body = text_of(message).strip().replace("\n", " ")
+        console.print(f"[{style}]{kind:12}[/]{pruned} {body[:150]}")
+        if calls:
+            console.print(f"[dim]             → 调用 {calls}[/]")
+
+
+def cmd_history(args: argparse.Namespace) -> int:
+    """查看历史记录：不带 --thread-id 列会话，带了则打印完整记录。"""
+    from code_agent.config import Settings
+    from code_agent.graph import build_graph, open_checkpointer
+    from code_agent.paths import RepoRoot
+
+    settings = Settings.from_env()
+    root = RepoRoot(args.repo or ".")
+    _check_pg(settings.pg_dsn)
+
+    with open_checkpointer(settings.pg_dsn) as checkpointer:
+        graph = build_graph(root, settings, checkpointer)
+        if args.thread_id:
+            _print_transcript(graph, args.thread_id)
+        else:
+            _list_sessions(graph, str(root))
+    return 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """完整模式：supervisor 调度三个 worker，PostgreSQL 持久化。"""
     from langchain_core.messages import HumanMessage
@@ -301,7 +427,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     _check_pg(settings.pg_dsn)
     with open_checkpointer(settings.pg_dsn) as checkpointer:
         graph = build_graph(root, settings, checkpointer)
-        config = {"configurable": {"thread_id": thread_id}, "recursion_limit": RECURSION_LIMIT}
+        config = _config(thread_id, str(root))
         base = {m.id for m in graph.get_state(config).values.get("messages", [])}
         streamed = _drive(
             graph,
@@ -337,7 +463,7 @@ def cmd_agent(args: argparse.Namespace) -> int:
     thread_id = args.thread_id or uuid.uuid4().hex
     console.print(f"[dim]仓库[/] {root}\n[dim]任务[/] {args.task}")
 
-    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": RECURSION_LIMIT}
+    config = _config(thread_id, str(root))
     streamed = _drive(worker, {"messages": [HumanMessage(args.task)]}, config, label=args.agent)
     final = _final_answer(worker.get_state(config).values.get("messages", []))
 
@@ -402,10 +528,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 console.print(f"[dim]已开新会话[/] {thread_id}\n")
                 continue
 
-            config = {
-                "configurable": {"thread_id": thread_id},
-                "recursion_limit": RECURSION_LIMIT,
-            }
+            config = _config(thread_id, str(root))
             payload = {"messages": [HumanMessage(line)], "attempts": 0, "made_edits": False}
 
             base = {m.id for m in graph.get_state(config).values.get("messages", [])}
@@ -455,6 +578,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--thread-id", help="会话 ID，用于跨次运行续接同一会话")
     parser.add_argument(
+        "--history", action="store_true",
+        help="查看历史记录：列出会话；配合 --thread-id 打印完整记录（含被剪掉的工具调用）",
+    )
+    parser.add_argument(
         "--check", action="store_true", help="自检：验证模型连通与 tool calling"
     )
     return parser
@@ -469,6 +596,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_check(args)
 
     try:
+        if args.history:
+            return cmd_history(args)
         if args.chat:
             return cmd_chat(args)
         if args.agent:

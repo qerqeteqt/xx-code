@@ -848,6 +848,59 @@ LangChain 的 `AIMessage.usage_metadata` 就带 `input_tokens` / `output_tokens`
 
 ---
 
+## 新增 — `--history` 查看会话记录（2026-09-13）
+
+### 背景
+
+用户问"聊天记录存在哪里，我去看看"。先说结论：**直接看数据库不可行** ——
+消息存在 `checkpoint_blobs.blob` 里，类型是 **msgpack 二进制**，SQL 查出来是乱码，
+必须反序列化才能读。
+
+存储位置（本机 PostgreSQL `langgraph_db`，连接串在 `.env` 的 `AGENT_PG_DSN`）：
+
+| 表 | 存什么 |
+|---|---|
+| `checkpoints` | 每前进一步一个快照的元信息（jsonb，几百字节） |
+| `checkpoint_blobs` | **消息正文**（msgpack 二进制） |
+| `checkpoint_writes` | 节点中间写入（也是 blob） |
+
+### 改动
+
+| 文件 | 说明 |
+|---|---|
+| `cli.py` | 新增 `--history`：不带 `--thread-id` 列出会话；带上则打印**完整记录** |
+| `cli.py` | 新增 `merge_history()`：把多个历史快照合并成完整消息序列（按 id 去重），并标出"已不在上下文里"的 |
+| `cli.py` | invoke 时带 `metadata={"repo": ...}`，以后可**按仓库**筛会话（老会话没标记） |
+| `tests/test_cli_history.py` | 新增 2 例 |
+
+### 验证
+
+```bash
+xx-code --history                                  # 列会话
+xx-code --history --thread-id eee627c4…            # 打印完整记录
+```
+
+```
+9 个快照，合并后 33 条消息；标 ·已剪 的表示当前不在模型上下文里（记录本身仍在库里）
+HumanMessage  运行测试，把失败的修好
+AIMessage     ·已剪 I'll start by exploring the repository structure…
+             → 调用 ['list_dir', 'glob_search']
+ToolMessage   ·已剪 calc.py (144 B) test_calc.py (122 B)
+ToolMessage   ·已剪 # calc.py (共 8 行) 1  def add(a, b): …      ← 连文件内容都在
+```
+
+**最新状态只有 8 条，从历史里合并出 33 条** —— 被剪掉的 24 条全部可读。
+`pytest` → 110 passed, 1 skipped。
+
+### 备注与坑
+
+1. **剪枝不销毁记录**：LangGraph 每前进一步存一个快照（`checkpoints` 是 append-only），
+   被剪的消息仍留在**更早的快照**里。所以"不喂给模型" ≠ "删掉记录"。
+   —— 之前跟用户解释时我只说了"删掉"，措辞不准确，容易让人以为记录被销毁。
+2. 旧会话没记 repo 元信息 → 列表里归为"其它仓库/未标记"，用 `--thread-id` 仍可查看。
+
+---
+
 ## v1 收尾状态（M0–M4 全部完成）
 
 计划中的 5 个里程碑已全部落地，`xx-code` 现在能：

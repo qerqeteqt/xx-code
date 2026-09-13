@@ -67,7 +67,12 @@ xx-code --new                              # 强制开新会话
 xx-code --thread-id <id>                   # 精确指定要续接的会话
 xx-code --agent explorer "这项目怎么跑测试"  # 只跑单个 worker
 xx-code --check                            # 环境自检（模型连通 + tool calling）
+xx-code --history                          # 查看历史：列出会话
+xx-code --history --thread-id <id>         # 查看某次会话的完整记录（含被剪掉的工具调用与结果）
 ```
+
+记录存在本机 PostgreSQL（`langgraph_db`，连接串在 `.env`）。**别想着直接查表** ——
+消息是 msgpack 二进制，SQL 出来是乱码；用 `--history` 看。
 
 找不到 `xx-code` 就说明没激活环境（先 `conda activate langgraph`），
 或用等价的 `python -m code_agent.cli`。
