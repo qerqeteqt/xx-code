@@ -1188,6 +1188,87 @@ explorer  → web_search(...)          ← 用的是有边界的 Tavily，不再
 
 ---
 
+## 新增 — 跨会话长期记忆（Milvus + text-embedding-v4）（2026-09-13）
+
+### 目标
+
+补上之前明确推迟的**长期记忆**（跨会话的事实记忆）。用户有本地 Milvus（Docker）
+和 DashScope 的 `text-embedding-v4` key，所以走**语义检索**这条路线。
+
+### 关键发现：`langchain-milvus` 与 Milvus 3.0 不兼容 → 改为直连 `pymilvus`
+
+实测报 `ConnectionNotExistException: should create connection first`。查源码：
+它把 `MilvusClient._using` 当成 alias 去调 ORM 的 `Collection(using=...)`，
+而 **`MilvusClient` 不会注册 named connection** —— 必然失败。
+（服务端 Milvus 3.0.0 + pymilvus 2.6.12 + langchain-milvus 0.3.3）
+
+→ 改用 `pymilvus` 直连。这反而更合本项目的风格（工具自研、checkpointer 自己实现），
+而且少一层抽象。
+
+### 改动
+
+| 文件 | 说明 |
+|---|---|
+| `code_agent/memory.py` | **新增**：`Embedder`（DashScope）/ `Memory` / `MemoryStore` 抽象 / `MilvusStore` / `InMemoryStore` / `extract_operations` / `apply_operations` / `build_store` |
+| `config.py` | 新增 `dashscope_api_key` / `milvus_uri` / `embedding_model` / `memory_threshold` |
+| `cli.py` | 启动时建 store；**首次任务注入一次**记忆；新增 `:memory` 命令；会话结束自动抽取 |
+| `.env` | 加 `AGENT_MILVUS_URI` / `DASHSCOPE_API_KEY`（并清掉过时的 PostgreSQL 条目） |
+| `tests/` | `test_memory.py`（14 例）+ `test_memory_extract.py`（10 例），**全部离线** |
+
+设计要点：
+
+- **作用域按项目分**：collection 名 = 项目路径规范化后的 hash（`cax_mem_<10位>`）。
+- **存储抽象**：`MilvusStore`（真后端）与 `InMemoryStore`（纯 Python 余弦，测试/降级用）接口一致。
+- **注入只做一次**：判断"消息里还没出现过 `[相关记忆]` 标记"就注入 —— 顺便避免
+  用户第一句只是寒暄时拿寒暄去检索。用"还没注入过"而不是"第一个用户轮"。
+- **两个阈值，用途不同**（实测得出）：
+
+  | 阈值 | 值 | 用途 |
+  |---|---|---|
+  | 写入去重 | **0.92** | 相似度够高就判为同一条 → **update 而不是新增**（保留 id） |
+  | 检索注入 | **0.35** | 实测换个说法来问最高分只有 0.6 左右；用 0.92 会什么都搜不到 |
+
+- **抽取放在图之外、会话结束时**：独立一次 LLM 调用，失败不影响任务收尾。
+
+### 验证（真实链路，不是 mock）
+
+```
+写 3 条                        → count = 3
+写近似重复「项目用 pytest -q 来跑测试」
+  → 命中了已有条目 = True，count 仍为 3          ← 去重生效
+检索「怎么跑测试」
+  score=0.6131  [preference] 项目用 pytest -q 来跑测试   ← 排序语义正确
+  score=0.4137  [fact]       项目跑在 conda env langgraph 里
+```
+
+**跨会话验收**：在**全新会话 + 空目录**里问「这个项目怎么跑测试？」
+→ 回答 `python -m pytest -q`（项目约定）—— 信息**完全来自长期记忆**。
+
+**自动抽取验收**：会话开始时 0 条 → 用户说了偏好 → 退出时自动新增 3 条：
+
+```
+[convention] 项目测试使用 python -m pytest -q 命令。
+[preference] 用户偏好使用中文回复。
+[convention] 项目运行在 conda env langgraph 中。
+```
+
+`pytest` → **166 passed, 1 skipped**。
+
+### 备注与坑（三个都是"离线测试过、真实链路挂"）
+
+1. **Milvus 的 `search` 结果 `entity` 不自动带主键 `id`** → `KeyError: 'id'`。
+   必须显式写进 `output_fields`。离线单测用 `InMemoryStore` 时 id 是现成的，发现不了。
+2. **collection 名对路径写法敏感**：写记忆时用 `"D:/a/b"`（正斜杠）、CLI 里用
+   `RepoRoot` 解析出的 `"D:\a\b"`（反斜杠）→ hash 不同 → **建了两个库、互相看不见**。
+   → 先 `os.path.normcase(os.path.abspath(...))` 规范化再 hash。
+3. `MilvusClient` 默认**最终一致**：写完立刻 `query` 可能查不到 → 列全部时要
+   `consistency_level="Strong"`。（`search` 不受影响。）
+
+> 又一次印证：**这类集成问题只有拿真服务跑才暴露**。13 个离线单测全绿，
+> 一接真 Milvus 就连续撞了 3 个。
+
+---
+
 ## v1 收尾状态（M0–M4 全部完成）
 
 计划中的 5 个里程碑已全部落地，`xx-code` 现在能：

@@ -8,22 +8,24 @@ Supervisor 调度三个 Agent —— **Explorer**（定位代码）/ **Coder**�
 
 ## 状态
 
-可多轮对话（短期记忆）、回答流式输出、会话存**本地 JSONL 文件**（不需要数据库）、支持联网检索。
-**116 passed, 1 skipped** —— 含 supervisor 路由 / 图接线 / HITL / 并发 / 剪枝 / JSONL 持久化的回归测试。
+可多轮对话（短期记忆）、**跨会话长期记忆（Milvus + 语义检索）**、回答流式输出、
+会话存**本地 JSONL 文件**（不需要数据库）、支持联网检索。
+**166 passed, 1 skipped** —— 含 supervisor 路由 / 图接线 / HITL / 并发 / 剪枝 / JSONL 持久化的回归测试。
 
 编排已升级到**方案 B**：共享黑板里**只保留人话**（任务 / 指令 / 各成员汇报），
 worker 内部的工具调用与结果会在 supervisor 下一轮开始时被剪掉（`supervisor.prune_scratchpad`）。
 实测同任务的持久化状态从 44 条消息（含 24 条工具消息）降到 **8 条消息、0 条工具消息**。
 剩余待办见 [DEVLOG.md](DEVLOG.md) 末尾的「v1 收尾状态」。
 
-**待做：长期记忆** —— 用 Markdown 文档存储与检索（仿 Claude Code 的 `memory/` 方案），
-与现在的短期记忆（JSONL 会话状态）分开。
+长期记忆也已落地：**Milvus + text-embedding-v4 语义检索**，会话结束时自动抽取、
+下次会话自动注入（少了 Milvus / embedding key 就自动关闭，不影响其余功能）。
 
 ## 环境
 
 - Python **3.13**（conda env `langgraph`）
-- 不需要数据库 —— 会话状态与记录都存本地文件
-- **DeepSeek API**（Anthropic 兼容端点）
+- **Milvus**（长期记忆的向量库；不可用时该功能自动关闭）
+- **DeepSeek API**（Anthropic 兼容端点）；**DashScope** `text-embedding-v4`（长期记忆的 embedding）
+- 会话状态与记录存本地文件，**不需要数据库**
 
 ## 开始
 
@@ -72,6 +74,7 @@ xx-code --agent explorer "这项目怎么跑测试"  # 只跑单个 worker
 xx-code --check                            # 环境自检（模型连通 + tool calling）
 xx-code --history                          # 查看历史：列出会话
 xx-code --history --thread-id <id>         # 查看某次会话的完整记录（含被剪掉的工具调用与结果）
+#    交互模式里另有 :memory 查看长期记忆
 ```
 
 记录存在 `<项目根>/.code_agent_sessions/年/月/日/`，一个会话两个文件：
@@ -104,6 +107,7 @@ code_agent/
 ├── cli.py         # 入口：交互模式 / 流式输出 / HITL 确认
 ├── graph.py       # 组装 StateGraph
 ├── jsonl_saver.py # 会话持久化（本地 JSONL，替代数据库）
+├── memory.py      # 跨会话长期记忆（Milvus 语义检索 + 自动抽取/注入）
 ├── supervisor.py  # 中心调度（JSON 路由 + 指令注入 + 生成回答）
 ├── workers.py     # Explorer / Coder / Verifier 三个子图（最小权限）
 ├── state.py       # 父图共享 State

@@ -20,10 +20,18 @@ from rich.markup import escape
 from rich.panel import Panel
 
 from code_agent.config import SESSION_DIR
+from code_agent.memory import build_store
 from code_agent.messages import text_of
 from code_agent.transcript import Transcript
 
 AGENT_ROLES = ("explorer", "coder", "verifier")
+
+# 长期记忆：检索注入用。
+# 注意注入阈值（0.35）比写入去重的阈值（0.92）**宽松得多** —— 实测换个说法来问，
+# 最高相似度也只有 0.6 左右；用 0.92 当检索阈值会什么都搜不到。
+MEMORY_MARKER = "[相关记忆]"
+MEMORY_TOP_K = 3
+MEMORY_MIN_SCORE = 0.35
 
 # 图执行的步数上限（兜底，真正的轮次控制是 supervisor 的 attempts）
 RECURSION_LIMIT = 250
@@ -320,6 +328,65 @@ def _drive(graph, payload, config, label: str | None = None,
     return turn
 
 
+def _memory_block(store, query: str) -> str:
+    """检索长期记忆并压成一段可注入的文本。检索不到就返回空串。
+
+    注意这里的 `min_score`（0.35）比写入去重的阈值（0.92）**宽松得多** ——
+    实测换个说法来问，最高分也只有 0.6 左右；用 0.92 当检索阈值会什么都搜不到。
+    两个阈值用途不同，别混。
+    """
+    hits = store.search(query, k=MEMORY_TOP_K, min_score=MEMORY_MIN_SCORE)
+    if not hits:
+        return ""
+    lines = "\n".join(f"- [{m.kind}] {m.text}" for m in hits)
+    return f"{MEMORY_MARKER}\n{lines}"
+
+
+def _has_memory_block(messages: list) -> bool:
+    """这个会话里是否已经注入过记忆（用来保证只注入一次）。"""
+    return any(
+        isinstance(m, HumanMessage) and text_of(m).startswith(MEMORY_MARKER)
+        for m in messages
+    )
+
+
+def _extract_memories(store, settings, messages: list, thread_id: str) -> None:
+    """会话结束：用**独立的一次 LLM 调用**把对话抽成长期记忆。
+
+    刻意放在图之外、会话收尾时做：不阻塞主流程，而且抽取失败也不影响任务本身
+    （`extract_operations` 内部吞异常）。
+    """
+    from code_agent.config import build_llm
+    from code_agent.memory import apply_operations, extract_operations
+
+    conversation = "\n".join(
+        f"{'用户' if message.type == 'human' else '助手'}: {text_of(message).strip()[:400]}"
+        for message in messages
+        if text_of(message).strip()
+    )
+    if len(conversation) < 200:  # 太短（比如只问了一句）就别抽了，免得把寒暄也记下来
+        return
+
+    console.print("[dim]正在整理长期记忆…[/]")
+    operations = extract_operations(build_llm(settings), conversation, store.all())
+    if not operations:
+        console.print("[dim]本次没有值得长期记住的内容。[/]")
+        return
+    added, updated, deleted = apply_operations(store, operations, source=thread_id)
+    console.print(f"[dim]长期记忆已更新：新增 {added} · 更新 {updated} · 删除 {deleted}[/]")
+
+
+def _print_memory(store) -> None:
+    """`:memory` —— 让人看看它到底记住了什么。"""
+    rows = store.all()
+    if not rows:
+        console.print("[dim]长期记忆还是空的。[/]")
+        return
+    console.print(f"[bold]长期记忆（{len(rows)} 条）[/]")
+    for m in rows:
+        console.print(f"  [dim]\\[{m.kind}][/] {m.text}")
+
+
 def _list_sessions(checkpointer, graph, root: str) -> None:
     """列出会话（文件名本身就是可读的：日期目录 / 时间-摘要-短id）。"""
     index: dict[str, str] = {}
@@ -518,8 +585,13 @@ def cmd_chat(args: argparse.Namespace) -> int:
         else:
             thread_id, label = uuid.uuid4().hex, "[dim]（新会话）[/]"
 
+    store = build_store(settings, str(root))
     console.print(f"[dim]仓库[/] {root}")
     console.print(f"[dim]会话[/] {thread_id}  {label}")
+    console.print(
+        "[dim]长期记忆[/] "
+        + (f"[green]开[/]（{store.count()} 条，:memory 查看）" if store else "[dim]关（未配置 Milvus / Embedding）[/]")
+    )
     console.print("[dim]直接输入任务即可；[/][cyan]:new[/][dim] 开新会话，[/][cyan]:q[/][dim] 退出[/]\n")
 
     with open_checkpointer() as checkpointer:
@@ -543,6 +615,13 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 _save_last_session(str(root), thread_id)
                 console.print(f"[dim]已开新会话[/] {thread_id}\n")
                 continue
+            if line == ":memory":
+                if store is None:
+                    console.print("[dim]长期记忆未启用（缺 AGENT_MILVUS_URI 或 DASHSCOPE_API_KEY）[/]\n")
+                else:
+                    _print_memory(store)
+                    console.print()
+                continue
 
             config = _config(thread_id, str(root))
             payload = {"messages": [HumanMessage(line)], "attempts": 0, "made_edits": False}
@@ -555,7 +634,17 @@ def cmd_chat(args: argparse.Namespace) -> int:
             transcript.header(str(root), thread_id)
             transcript.user(line)
 
-            base = {m.id for m in graph.get_state(config).values.get("messages", [])}
+            current = graph.get_state(config).values.get("messages", [])
+            base = {m.id for m in current}
+
+            # 长期记忆：**只在还没注入过时注入一次**。
+            # 用"还没注入过"而不是"第一个用户轮"，是为了避免用户第一句只是寒暄
+            # （"你好"）时拿寒暄去检索、白跑一次还把位置占掉。
+            if store is not None and not _has_memory_block(current):
+                block = _memory_block(store, line)
+                if block:
+                    payload["messages"].insert(0, HumanMessage(block))
+                    console.print("[dim]（已注入相关长期记忆）[/]")
             try:
                 streamed = _drive(graph, payload, config, transcript=transcript)
             except RuntimeError as exc:
@@ -572,6 +661,12 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 )
                 console.print(Panel(final, title="最终结论", border_style="green"))
                 transcript.answer(final)
+
+        # 读一段对话用于抽取记忆 —— 必须在 checkpointer 关掉之前读
+        final_messages = graph.get_state(_config(thread_id, str(root))).values.get("messages", [])
+
+    if store is not None:
+        _extract_memories(store, settings, final_messages, thread_id)
 
     _print_usage(session, "本次运行累计")
     console.print(f"\n[dim]会话已保存到 {SESSION_DIR}（退出不会丢）。下次继续：[/]")

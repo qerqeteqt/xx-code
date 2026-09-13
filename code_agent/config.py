@@ -41,6 +41,11 @@ class Settings:
     auth_token: str
     model: str
     tavily_api_key: str | None
+    # 长期记忆（缺任一项则该功能自动关闭）
+    dashscope_api_key: str | None = None
+    milvus_uri: str | None = None
+    embedding_model: str = "text-embedding-v4"
+    memory_threshold: float = 0.92
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -58,6 +63,10 @@ class Settings:
             auth_token=os.environ["AGENT_AUTH_TOKEN"],
             model=os.environ["AGENT_MODEL"],
             tavily_api_key=os.getenv("TAVILY_API_KEY") or None,
+            dashscope_api_key=os.getenv("DASHSCOPE_API_KEY") or None,
+            milvus_uri=os.getenv("AGENT_MILVUS_URI") or None,
+            embedding_model=os.getenv("AGENT_EMBEDDING_MODEL") or "text-embedding-v4",
+            memory_threshold=float(os.getenv("AGENT_MEMORY_THRESHOLD") or 0.92),
         )
 
     def describe(self) -> str:
