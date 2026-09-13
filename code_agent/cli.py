@@ -155,15 +155,19 @@ def _ask(interrupt_value) -> str:
     return "approve" if answer in ("y", "yes") else "reject"
 
 
-def _final_answer(messages: list) -> str:
-    """最后一条 AI 文本（通常是 verifier 的结论）。"""
-    for message in reversed(messages):
+def _final_answer(messages: list, since: int = 0) -> str:
+    """取最后一条 AI 文本。
+
+    `since` 之前（以往轮次）的消息一律不看 —— 否则本轮万一没产出回答，
+    就会把**上一轮的旧回答**当成结果展示（实测踩到过）。
+    """
+    for message in reversed(messages[since:]):
         if not isinstance(message, AIMessage):
             continue
         text = text_of(message).strip()
         if text:
             return text
-    return "(无输出)"
+    return "(本轮没有产生回答)"
 
 
 def _stream_once(graph, payload, config, seen: set, label: str | None = None):
@@ -237,8 +241,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     with open_checkpointer(settings.pg_dsn) as checkpointer:
         graph = build_graph(root, settings, checkpointer)
         config = {"configurable": {"thread_id": thread_id}, "recursion_limit": RECURSION_LIMIT}
+        base = len(graph.get_state(config).values.get("messages", []))
         _drive(graph, {"messages": [HumanMessage(args.task)], "attempts": 0}, config)
-        final = _final_answer(graph.get_state(config).values.get("messages", []))
+        final = _final_answer(
+            graph.get_state(config).values.get("messages", []), since=base
+        )
 
     console.print(Panel(final, title="最终结论", border_style="green"))
     return 0
@@ -334,6 +341,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
             }
             payload = {"messages": [HumanMessage(line)], "attempts": 0}
 
+            base = len(graph.get_state(config).values.get("messages", []))
             try:
                 _drive(graph, payload, config)
             except RuntimeError as exc:
@@ -341,7 +349,9 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 console.print(f"[red]本轮出错：[/]{escape(str(exc))}\n")
                 continue
 
-            final = _final_answer(graph.get_state(config).values.get("messages", []))
+            final = _final_answer(
+                graph.get_state(config).values.get("messages", []), since=base
+            )
             console.print(Panel(final, title="最终结论", border_style="green"))
 
     console.print("[dim]会话结束。[/]")

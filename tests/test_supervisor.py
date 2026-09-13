@@ -99,6 +99,31 @@ def test_attempts_is_a_per_turn_counter(scripted):
     assert _route(scripted, '{"next": "coder"}', attempts=0).goto == "coder"
 
 
+def test_answer_ids_do_not_collide_across_turns(scripted):
+    """回归：回答的 id 必须逐轮唯一。
+
+    曾经用 `supervisor-answer-{attempts}` 当确定性 id，而 attempts 每轮都会重置，
+    于是第二轮的 id 与第一轮**相同** → `add_messages` 按 id 去重，把新回答
+    **覆盖到对话开头的旧位置**，CLI 取"最后一条 AI 消息"时拿到的还是上一轮的旧回答；
+    同时那条被覆盖的历史消息也被污染了。
+    """
+    llm = scripted([
+        AIMessage(content='{"next": "finish"}'), AIMessage(content="回答A"),
+        AIMessage(content='{"next": "finish"}'), AIMessage(content="回答B"),
+    ])
+    node = make_supervisor(llm)
+
+    turn1 = node({"messages": [HumanMessage("任务1", id="msg-1")], "attempts": 0})
+    turn2 = node({
+        "messages": [HumanMessage("任务1", id="msg-1"), HumanMessage("任务2", id="msg-2")],
+        "attempts": 0,   # 每轮都从 0 开始（CLI 会重置）
+    })
+
+    assert turn1.update["messages"][0].id != turn2.update["messages"][0].id
+    assert "回答A" in turn1.update["messages"][0].content
+    assert "回答B" in turn2.update["messages"][0].content
+
+
 def test_digest_is_bounded(scripted):
     """会话越聊越长，喂给 supervisor 的摘要必须有长度上限（否则每轮都变慢变贵）。"""
     from code_agent.supervisor import MAX_DIGEST_CHARS, _digest

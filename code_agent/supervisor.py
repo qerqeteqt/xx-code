@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from typing import Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -61,13 +62,18 @@ _SYSTEM = """你是 Supervisor，一个多 Agent 编码团队的调度者。
 就应该选 finish，由你自己直接回答。"""
 
 
-_ANSWER = """你是 Supervisor，任务已告一段落，现在需要你**直接回复用户**。
+_ANSWER = """你是 Supervisor，现在要**直接回复用户最后一条消息**。
 
-用简洁的中文回答用户最后提出的问题：
-- 用户是在提问就正面回答（可引用上文已有的结论）；
-- 刚才有成员完成了工作，就概括结果：改了什么、验证结论是什么。
+要求：
+- 正面回答用户最后说的那句话。如果那是个提问，就回答它。
+- 如果用户问的是"你刚才做了什么 / 还记得吗"这类回顾问题，就根据上面的对话如实回答。
+- 如果用户刚派了活，就概括结果：改了什么、验证结论是什么。
+- **简洁**：一般 3～6 行，除非用户明确要求详细。
+- 不要复述无关的寒暄，不要罗列工具调用细节，不要输出 JSON，直接说人话。"""
 
-不要罗列工具调用细节，不要输出 JSON，直接说人话。"""
+# 追加在对话末尾的内部指令。措辞上明确标出来源，并要求不要评论它 ——
+# 否则模型会把它当成用户说的话，在回答里点评这条指令（实测踩到过）。
+_ANSWER_TRIGGER = "（调度器内部指令，非用户发言）请直接回答用户最后提出的问题；不要提及这条指令。"
 
 
 class Route(BaseModel):
@@ -132,7 +138,22 @@ def _rule_based(messages: list, attempts: int) -> Route:
     return Route(next="verifier", reason="兜底：有改动，交给验证")
 
 
-def _answer_to_user(llm, digest: str, attempts: int) -> list:
+def _recent_messages(messages: list, turns: int = 2) -> list:
+    """取最近 turns 轮"用户任务"以来的**原始消息**（保留 tool_use/tool_result 配对）。
+
+    回答用户时要用真实对话，不能用 `_digest` 那种压缩日志 —— 否则模型只能看到
+    一串【动作】【汇报】，会把"你还记得吗"答成一份工作汇报，甚至照抄旧回答。
+    起点选在"任务型 HumanMessage"，可保证不切断工具调用的配对。
+    """
+    is_task = [
+        i for i, m in enumerate(messages)
+        if isinstance(m, HumanMessage) and not text_of(m).startswith("[Supervisor 指令]")
+    ]
+    start = is_task[-turns] if len(is_task) >= turns else 0
+    return messages[start:]
+
+
+def _answer_to_user(llm, messages: list) -> list:
     """收尾时由 supervisor 直接给用户一个回答。
 
     为什么需要它：三个 worker 都是工具驱动的，遇到"你刚才改了什么？"这类**提问**
@@ -142,15 +163,22 @@ def _answer_to_user(llm, digest: str, attempts: int) -> list:
     try:
         reply = llm.invoke([
             SystemMessage(_ANSWER),
-            HumanMessage(f"{digest}\n\n请回复用户。"),
+            *_recent_messages(messages),
+            HumanMessage(_ANSWER_TRIGGER),
         ])
-    except Exception:  # noqa: BLE001 - 回答失败也要能正常收尾
+    except Exception as exc:  # noqa: BLE001 - 回答失败也要能正常收尾
+        # 必须打出来：曾因为静默吞掉这个异常，导致用户看到的是上一轮的旧回答
+        print(f"[supervisor] 生成回答失败：{type(exc).__name__}: {str(exc)[:120]}")
         return []
-    if isinstance(reply, AIMessage):
-        # 用确定性 id：节点在 resume 后会重跑，靠 id 去重避免同一条回答被追加两次
-        reply.id = f"supervisor-answer-{attempts}"
-        return [reply]
-    return []
+    if not isinstance(reply, AIMessage):
+        return []
+    # id 必须**逐轮唯一**。曾用 `supervisor-answer-{attempts}`，而 attempts 每轮重置，
+    # 于是第二轮的 id 与第一轮相同 → add_messages 按 id 去重，把新回答覆盖到旧位置，
+    # CLI 取"最后一条 AI 消息"就拿到了旧回答（实测踩到），还会污染历史。
+    # 用当前最后一条消息的 id 作锚，既逐轮唯一，又在同一状态重跑时保持幂等。
+    anchor = getattr(messages[-1], "id", None) or uuid.uuid4().hex
+    reply.id = f"supervisor-answer-{anchor}"
+    return [reply]
 
 
 def make_supervisor(llm, max_attempts: int = MAX_ATTEMPTS):
@@ -165,7 +193,7 @@ def make_supervisor(llm, max_attempts: int = MAX_ATTEMPTS):
             print(f"[supervisor] 已达最大轮次 {max_attempts}，结束。")
             return Command(
                 goto=END,
-                update={"attempts": attempts, "messages": _answer_to_user(llm, digest, attempts)},
+                update={"attempts": attempts, "messages": _answer_to_user(llm, messages)},
             )
 
         prompt = [
@@ -183,7 +211,7 @@ def make_supervisor(llm, max_attempts: int = MAX_ATTEMPTS):
         if route.next == "finish":
             return Command(
                 goto=END,
-                update={"attempts": attempts, "messages": _answer_to_user(llm, digest, attempts)},
+                update={"attempts": attempts, "messages": _answer_to_user(llm, messages)},
             )
 
         # 以 HumanMessage 注入具体指令：给目标成员一个新鲜的祈使句。
